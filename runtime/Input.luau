@@ -3,10 +3,15 @@ Input.__index = Input
 
 function Input.new(config)
 	config = config or {}
+	local deadzone = config.dragDeadzone or 4
+	assert(type(deadzone) == "number" and deadzone >= 0 and deadzone < math.huge, "Invalid drag deadzone")
 	local self = setmetatable({bindings = config.bindings or {}, behaviors = config.behaviors or {},
 		sources = {}, toggled = {}, presses = {}, touch = {}, stick = Vector2.zero,
 		connections = {}, clock = config.clock or os.clock, enabled = true,
-		pointer = {x = 0, y = 0, inside = false}, canvas = config.canvas,
+		pointer = {x = 0, y = 0, virtualX = 0, virtualY = 0, inside = false,
+			down = false, dragging = false, startX = 0, startY = 0, deltaX = 0, deltaY = 0, cancelled = false},
+		canvas = config.canvas, canvasScale = config.canvasScale, dragDeadzone = deadzone,
+		layout = config.layout or "Platformer", pointerSecondary = false,
 		touchMode = config.touchMode or "Auto", lastType = nil}, Input)
 	if config.connect ~= false then self:connect(config) end
 	return self
@@ -44,6 +49,7 @@ function Input:consumeBuffer(action, windowSeconds)
 	return self.enabled and at ~= nil and self.clock() - at <= windowSeconds
 end
 function Input:reset()
+	self:cancelPointer()
 	table.clear(self.sources); table.clear(self.presses); table.clear(self.toggled); table.clear(self.touch)
 	self.stick = Vector2.zero; self.moveTouch = nil; self.pointerTouch = nil
 end
@@ -58,13 +64,25 @@ end
 -- Same dispatch path is used for real events and deterministic regression tests.
 function Input:process(phase, event, processed)
 	local kind = event.UserInputType.Name
+	if kind == "Touch" then
+		if self.layout == "Pointer" then self:processTouchPointer(phase, event, processed) end
+		return
+	end
 	if kind ~= "Keyboard" and kind ~= "Gamepad1" and not kind:match("^Mouse") then return end
 	local key = if kind:match("^MouseButton") then kind else event.KeyCode.Name
 	if phase == "Changed" and key == "Thumbstick1" and kind == "Gamepad1" then
 		if self.enabled then self.stick = Vector2.new(event.Position.X, -event.Position.Y) end; return
 	end
-	if kind == "MouseMovement" then self:updatePointer(event.Position); return end
+	if kind == "MouseMovement" then
+		if not self.pointerTouch then self:updatePointer(event.Position) end
+		return
+	end
 	if phase ~= "Ended" and (processed or not self.enabled) then return end
+	if self.layout == "Pointer" and kind == "MouseButton1" and not self.pointerTouch then
+		self:updatePointer(event.Position)
+		if phase == "Began" then self:beginPointer("MouseButton1")
+		elseif phase == "Ended" then self:endPointer("MouseButton1") end
+	end
 	local down = phase ~= "Ended"
 	local trigger = key == "ButtonL2" or key == "ButtonR2"
 	if phase == "Changed" then
@@ -83,10 +101,64 @@ function Input:updatePointer(position)
 	if not self.canvas then return end
 	local p, size = self.canvas.AbsolutePosition, self.canvas.AbsoluteSize
 	local x, y = (position.X - p.X) / math.max(1, size.X), (position.Y - p.Y) / math.max(1, size.Y)
-	self.pointer = {x = math.clamp(x, 0, 1), y = math.clamp(y, 0, 1), inside = x >= 0 and x <= 1 and y >= 0 and y <= 1}
+	local scale = if self.canvasScale then self.canvasScale.Scale else 1
+	local pointer = self.pointer
+	pointer.x = math.clamp(x, 0, 1); pointer.y = math.clamp(y, 0, 1)
+	pointer.virtualX = (position.X - p.X) / math.max(1e-6, scale)
+	pointer.virtualY = (position.Y - p.Y) / math.max(1e-6, scale)
+	pointer.inside = x >= 0 and x <= 1 and y >= 0 and y <= 1
+	if pointer.down then
+		pointer.deltaX = pointer.virtualX - pointer.startX; pointer.deltaY = pointer.virtualY - pointer.startY
+		if pointer.deltaX ^ 2 + pointer.deltaY ^ 2 > self.dragDeadzone ^ 2 then pointer.dragging = true end
+	end
+end
+function Input:beginPointer(owner)
+	local pointer = self.pointer
+	if not self.enabled or not pointer.inside or pointer.down then return end
+	self.pointerOwner = owner
+	pointer.down = true; pointer.dragging = false; pointer.cancelled = false
+	pointer.startX = pointer.virtualX; pointer.startY = pointer.virtualY
+	pointer.deltaX = 0; pointer.deltaY = 0
+end
+function Input:endPointer(owner)
+	local pointer = self.pointer
+	if self.pointerOwner ~= owner or not pointer.down then return end
+	-- Keep one pending release, like consumeBuffer; unused input cannot grow a queue.
+	self.drop = {startX = pointer.startX, startY = pointer.startY,
+		x = pointer.virtualX, y = pointer.virtualY, wasDrag = pointer.dragging, inside = pointer.inside}
+	pointer.down = false; pointer.dragging = false; self.pointerOwner = nil
+end
+function Input:cancelPointer()
+	local pointer = self.pointer
+	if pointer.down then pointer.cancelled = true end
+	pointer.down = false; pointer.dragging = false; self.pointerOwner = nil
+	self.drop = nil
+end
+function Input:consumeDrop()
+	local drop = self.drop; self.drop = nil; return drop
+end
+function Input:processTouchPointer(phase, event, processed)
+	if phase == "Began" then
+		if processed or not self.enabled or self.touchMode == "Off" or self.pointerTouch or self.pointer.down
+			or (self.overlay and not self.overlay.Visible) then return end
+		self:updatePointer(event.Position)
+		if not self.pointer.inside then return end
+		self.pointerTouch = event; self.pointerAction = if self.pointerSecondary then "secondary" else "primary"
+		self:setSource(self.pointerAction, "TouchPointer", true)
+		if self.pointerAction == "primary" then self:beginPointer(event) end
+	elseif event == self.pointerTouch then
+		self:updatePointer(event.Position)
+		if phase == "Ended" then
+			self:endPointer(event)
+			self:setSource(self.pointerAction, "TouchPointer", false); self.pointerTouch = nil
+		end
+	end
 end
 function Input:setTouchMode(mode)
 	assert(mode == "Auto" or mode == "On" or mode == "Off", "Invalid touch mode")
+	if mode == "Off" and self.pointerTouch then
+		self:cancelPointer(); self:setSource(self.pointerAction, "TouchPointer", false); self.pointerTouch = nil
+	end
 	self.touchMode = mode; self:updateTouchVisibility()
 end
 function Input:updateTouchVisibility()
@@ -98,6 +170,7 @@ function Input:updateTouchVisibility()
 		for action, sources in self.sources do
 			for source in sources do if type(source) ~= "string" or source:match("^Touch") then self:setSource(action, source, false) end end
 		end
+		if self.pointerTouch then self:cancelPointer() end
 		self.moveTouch = nil; self.pointerTouch = nil
 	end
 end
@@ -128,6 +201,7 @@ function Input:connect(config)
 	if config.hud then self:mountTouch(config.hud, config.layout or "Platformer", config.actions or {{action = "jump", label = "Jump"}, {action = "dash", label = "Dash"}, {action = "grab", label = "Grab"}}) end
 end
 function Input:mountTouch(hud, layout, actions)
+	self.layout = layout
 	local overlay = Instance.new("Frame"); overlay.Name = "TouchControls"; overlay.Size = UDim2.fromScale(1, 1)
 	overlay.BackgroundTransparency = 1; overlay.Parent = hud; self.overlay = overlay
 	local function button(name, label, position, size)
@@ -140,15 +214,10 @@ function Input:mountTouch(hud, layout, actions)
         return b
 	end
 	if layout == "Pointer" then
-		local right = false
 		local toggle = button("RightClick", "Right click: off", UDim2.new(1, -150, 1, -64), UDim2.fromOffset(138, 50))
-		self:_track(toggle.Activated:Connect(function() right = not right; toggle.Text = if right then "Right click: on" else "Right click: off" end))
-		self:_track(self.uis.TouchStarted:Connect(function(event, processed)
-			if processed or not overlay.Visible or self.pointerTouch then return end
-			self:updatePointer(event.Position)
-			if not self.pointer.inside then return end
-			self.pointerTouch = event; self.pointerAction = if right then "secondary" else "primary"
-			self:setSource(self.pointerAction, "TouchPointer", true)
+		self:_track(toggle.Activated:Connect(function()
+			self.pointerSecondary = not self.pointerSecondary
+			toggle.Text = if self.pointerSecondary then "Right click: on" else "Right click: off"
 		end))
 	else
 		local zone = button("Move", "", UDim2.new(0, 18, 1, -158), UDim2.fromOffset(140, 140))
@@ -184,11 +253,9 @@ function Input:mountTouch(hud, layout, actions)
 	end
 	self:_track(self.uis.TouchMoved:Connect(function(event)
 		if event == self.moveTouch then local center = self.moveZone.AbsolutePosition + self.moveZone.AbsoluteSize / 2; self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y) end
-		if event == self.pointerTouch then self:updatePointer(event.Position) end
 	end))
 	self:_track(self.uis.TouchEnded:Connect(function(event)
 		if event == self.moveTouch then self.moveTouch = nil; self:setTouchDirection(0, 0) end
-		if event == self.pointerTouch then self:setSource(self.pointerAction, "TouchPointer", false); self.pointerTouch = nil end
 		if self.touch[event] then self:setSource(self.touch[event], event, false); self.touch[event] = nil end
 	end))
 	self:updateTouchVisibility()

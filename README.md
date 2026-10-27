@@ -61,11 +61,96 @@ inputs and toggles to avoid unintended actions after returning.
 
 `layout = "Pointer"` maps direct canvas touch/drag to `primary` or `secondary`
 using an explicit right-click toggle. `input.pointer` contains normalized `x`,
-`y` and `inside`; it updates for mouse movement too. The pointer layout does not
-emulate multitouch gestures. `setTouchMode` accepts `Auto`, `On`, `Off`.
+`y` and `inside`; it updates for mouse movement too. `virtualX` / `virtualY`
+give unclamped canvas-pixel coordinates for hover footprints and range rings.
+`createApp` accounts for the shell's current UI scale, including Fit,
+PixelPerfect and Stretch. When constructing `Kit.Input` directly, pass `canvas`
+and its `canvasScale` UIScale if scaled; without `canvasScale`, pixels are 1:1.
+
+Primary mouse presses and touches beginning inside the canvas set `pointer.down`.
+While held, `startX` / `startY` record the initial virtual coordinates and
+`deltaX` / `deltaY` track displacement. `dragging` becomes true once Euclidean
+distance **exceeds** `input.dragDeadzone` (default `4` virtual pixels), and stays
+true until release. Configure it with `input = {layout = "Pointer",
+dragDeadzone = 4, ...}`. Moving outside the canvas continues tracking the drag.
+
+Call `input:consumeDrop()` once per update. It returns the latest unconsumed
+primary release as `{startX, startY, x, y, wasDrag, inside}`, or `nil`; all drop
+coordinates are virtual pixels. The release position is sampled even if there
+was no intervening movement event. A click has `wasDrag = false`. Consumption
+is one-shot, and a later release replaces an unconsumed one. No separate edge
+flag reset is required. After release, `down` and `dragging` are false, while
+the final start/displacement values remain available.
+
+Opening a modal or losing window focus cancels an active press, clears pending
+drops, and sets `pointer.cancelled = true`. Cancellation never produces a drop;
+the flag remains set until the next accepted primary press. Use it to discard a
+placement preview. Only one pointer owns a gesture; other touches cannot move or
+release it. Secondary-touch mode produces the `secondary` action without a
+primary drag/drop. Processed UI presses are ignored. The pointer layout does
+not emulate multitouch gestures. `setTouchMode` accepts `Auto`, `On`, `Off`;
+disabling/hiding touch controls also cancels an active touch.
 
 Call `app:destroy()` when unloading. All input, camera and character listeners
 are disconnected. Destroying the viewport also tears down the shell.
+
+## Fixed-step simulation and tower defense / strategy
+
+`Kit.Stepper.new({rate = 60, maxDelta = 0.25, maxStepsPerFrame = 8})` creates a
+fixed-timestep accumulator with `stepDt = 1 / rate`. Alternatively, pass
+`stepper = {rate = 60, maxSteps = 6}` to `createApp` and use `app.stepper`.
+`maxSteps` is an alias for `maxStepsPerFrame`; the latter takes precedence.
+The app only creates the clock; the game advances it and runs the simulation.
+
+`stepper:setSpeed(1)` runs at normal speed, `setSpeed(3)` runs three times as
+many fixed ticks, and `setSpeed(0)` pauses. Fractional positive speeds also work.
+Speed changes preserve the fractional accumulator and never change `stepDt`.
+`stepper:advance(dt)` returns `(stepsToRun, alpha)`, where `alpha` is in `[0, 1)`
+for interpolating previous/current simulation snapshots. Paused calls return
+zero steps and preserve the fraction without accumulating elapsed time.
+
+Each call clamps wall-clock `dt` to `maxDelta` **before** applying speed, and
+caps work at `ceil(maxStepsPerFrame * speed)` ticks (8 at 1x, 24 at 3x by default).
+Excess whole ticks are discarded while retaining the interpolation fraction,
+so lag spikes cannot create an ever-growing catch-up backlog. Overload therefore
+drops simulation time. With the same input, elapsed-time sequence and settings,
+the tick schedule is deterministic; gameplay randomness and input application
+must also be deterministic if the game needs replay/lockstep behavior.
+
+This example uses game-provided shop, placement, simulation and rendering helpers:
+
+```luau
+local app = Kit.createApp({
+    name = "StrategyPort", width = 960, height = 540,
+    input = {layout = "Pointer", dragDeadzone = 4,
+        bindings = {primary = {"MouseButton1"}, secondary = {"MouseButton2"}}},
+    stepper = {rate = 60, maxSteps = 6},
+})
+local clock, input = app.stepper, app.input
+local requestedSpeed = 1
+-- Wire the game's speed control to requestedSpeed = 1, 3, or 0.
+game:GetService("RunService").RenderStepped:Connect(function(dt)
+    local pointer = input.pointer
+    local tower = if pointer.down then shopTowerAt(pointer.startX, pointer.startY) else nil
+    if pointer.cancelled or not tower then
+        hideFootprint()
+    else
+        showFootprint(tower, pointer.virtualX, pointer.virtualY,
+            pointer.inside and canPlace(tower, pointer.virtualX, pointer.virtualY))
+    end
+    local drop = input:consumeDrop()
+    if drop and drop.wasDrag and drop.inside then
+        local draggedTower = shopTowerAt(drop.startX, drop.startY)
+        if draggedTower and canPlace(draggedTower, drop.x, drop.y) then
+            placeTower(draggedTower, drop.x, drop.y)
+        end
+    end
+    clock:setSpeed(if app.shell.open then 0 else requestedSpeed)
+    local steps, alpha = clock:advance(dt)
+    for _ = 1, steps do simTick(clock.stepDt) end
+    renderInterpolated(alpha) -- Includes bloons, projectiles and tower visuals.
+end)
+```
 
 ## GPU
 

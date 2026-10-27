@@ -48,7 +48,9 @@ class BakeTests(unittest.TestCase):
             emit_package(destination/'sdk.rbxmx',sdk/'runtime')
             root=ET.parse(destination/'sdk.rbxmx').getroot().find('Item')
             self.assertEqual(root.attrib['class'],'ModuleScript')
-            self.assertNotIn('SaveServer.server',[i.find('Properties/string').text for i in root.findall('Item')])
+            modules=[i.find('Properties/string').text for i in root.findall('Item')]
+            self.assertIn('Stepper',modules)
+            self.assertNotIn('SaveServer.server',modules)
             manifest=sync_vendor(sdk,destination/'vendor')
             for path,digest in manifest['files'].items():
                 self.assertEqual(hashlib.sha256((destination/'vendor'/path).read_bytes()).hexdigest(),digest)
