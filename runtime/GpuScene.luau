@@ -1,3 +1,4 @@
+--!native
 --!optimize 2
 local MobileProfile = if script then require(script.Parent.MobileProfile) else nil
 local originPosition = UDim2.fromOffset(0, 0)
@@ -35,8 +36,10 @@ local function publish(self,entry,properties)
     -- Hidden pooled objects must receive their complete geometry and crop
     -- before they can be made visible. Callers cannot publish early by passing
     -- Visible in the unordered property table.
-    for key,value in properties do if key~='Visible' and key~='Parent' and key~='ScrollingCrop' and entry.values[key]~=value then
-        entry.object[key]=value;entry.values[key]=value;self.writes+=1
+    local values=entry.values
+    -- Most keys are unchanged: test the value before the excluded names.
+    for key,value in properties do if values[key]~=value and key~='Visible' and key~='Parent' and key~='ScrollingCrop' then
+        entry.object[key]=value;values[key]=value;self.writes+=1
     end end
     if entry.parked and properties.Position==nil then
         local position=entry.parkedPosition or originPosition
@@ -62,8 +65,13 @@ local function publish(self,entry,properties)
     visible(self,entry,true)
 end
 
+-- Callers reuse immutable Vector2 crops; memoize static keys by identity.
+local staticKeys=setmetatable({},{__mode='k'})
 local function regionKey(properties)
 	local offset,size=properties.ImageRectOffset,properties.ImageRectSize
+	local bySize=offset and staticKeys[offset]
+	local cached=bySize and size and bySize[size]
+	if cached and properties.ScrollingCrop~=true then return cached,false end
 	local x,y,w,h=offset and offset.X or 0,offset and offset.Y or 0,size and size.X or 0,size and size.Y or 0
 	local fractional=properties.ScrollingCrop==true or x%1~=0 or y%1~=0 or w%1~=0 or h%1~=0
     if fractional then return "dynamic",true end
@@ -71,7 +79,12 @@ local function regionKey(properties)
 	-- table allocation for the usual integer atlas rectangles.
 	if x>=-4096 and x<4096 and y>=-4096 and y<4096 and w>=-4096 and w<4096 and h>=-4096 and h<4096
         and not fractional then
-		return (((x+4096)*8192+y+4096)*8192+w+4096)*8192+h+4096
+		local key=(((x+4096)*8192+y+4096)*8192+w+4096)*8192+h+4096
+		if offset and size then
+			if not bySize then bySize=setmetatable({},{__mode='k'});staticKeys[offset]=bySize end
+			bySize[size]=key
+		end
+		return key
 	end
 	-- Large integer rectangles retain exact static bucket isolation.
 	return string.format('%.17g:%.17g:%.17g:%.17g',x,y,w,h),fractional

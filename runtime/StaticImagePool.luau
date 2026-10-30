@@ -1,3 +1,4 @@
+--!native
 -- Immutable texture pages. Decode/upload/conversion run outside render callbacks.
 -- Labels and mesh materials share the returned Content; no editable image stays live.
 local Policy=require(script.Parent.EditableImagePolicy)
