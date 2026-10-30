@@ -1,0 +1,13 @@
+name = "3xjn/robloxportkit"
+version = "0.3.0"
+description = "Roblox runtime SDK for game ports (shell, input, GPU scene, pools, saves)"
+license = "UNLICENSED"
+includes = ["pesde.toml", "README.md", "runtime/**"]
+
+[target]
+environment = "roblox"
+lib = "runtime/init.luau"
+build_files = ["runtime"]
+
+[indices]
+default = "https://github.com/pesde-pkg/index"
