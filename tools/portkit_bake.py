@@ -13,13 +13,25 @@ MODULE_LIMIT = 180_000
 def strip_native(source: str) -> str:
     return re.sub(r'^\s*--!native[^\n]*(?:\n|$)', '', source, flags=re.MULTILINE)
 
-def write_blob(out: Path, key: str, raw: bytes, manifest: dict, chunk_size=170_000):
+def write_blob(out: Path, key: str, raw: bytes, manifest: dict, chunk_size=170_000, compression='zlib'):
     if not re.fullmatch(r'[A-Za-z0-9_]+', key):
         raise ValueError('key must be a Luau identifier')
     if not 1 <= chunk_size < MODULE_LIMIT - 12:
         raise ValueError('chunk size exceeds ModuleScript limit')
     out.mkdir(parents=True, exist_ok=True)
-    encoded = base64.b64encode(zlib.compress(raw, 9)).decode('ascii')
+    if compression == 'zstd':
+        try:
+            from compression import zstd
+        except ImportError:
+            import zstandard
+            compressed = zstandard.ZstdCompressor(level=10).compress(raw)
+        else:
+            compressed = zstd.compress(raw, level=10)
+    elif compression == 'zlib':
+        compressed = zlib.compress(raw, 9)
+    else:
+        raise ValueError('Unsupported payload compression: '+compression)
+    encoded = base64.b64encode(compressed).decode('ascii')
     names = []
     for i, start in enumerate(range(0, len(encoded), chunk_size)):
         name = f'VFS_{key}_{i:03}'
@@ -28,9 +40,10 @@ def write_blob(out: Path, key: str, raw: bytes, manifest: dict, chunk_size=170_0
         (out / (name + '.luau')).write_text(source, encoding='utf8')
         names.append(name)
     manifest[key] = dict(chunks=names, bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+    if compression != 'zlib': manifest[key]['compression'] = compression
 
 class AtlasPacker:
-    """Stable shelf packing with one-pixel transparent gutters and oversized tiling."""
+    """Stable shelf packing with neighboring texel gutters and oversized tiling."""
     def __init__(self, size=1024, first_page=1):
         if not 3 <= size <= 1024:
             raise ValueError('page size must be 3..1024')
@@ -62,9 +75,14 @@ class AtlasPacker:
                 if self.y + h + 2 > self.size:
                     self.flush()
                 x, y = self.x + 1, self.y + 1
-                for j in range(h):
-                    a = ((fy+j)*width+fx)*4; b = ((y+j)*self.size+x)*4
+                for j in range(-1,h+1):
+                    source_y=max(0,min(height-1,fy+j))
+                    a = (source_y*width+fx)*4; b = ((y+j)*self.size+x)*4
                     self.canvas[b:b+w*4] = pixels[a:a+w*4]
+                    left=(source_y*width+max(0,fx-1))*4
+                    right=(source_y*width+min(width-1,fx+w))*4
+                    self.canvas[b-4:b]=pixels[left:left+4]
+                    self.canvas[b+w*4:b+(w+1)*4]=pixels[right:right+4]
                 parts.append(dict(page=self.first_page+len(self.pages), x=x, y=y, w=w, h=h, fx=fx, fy=fy))
                 self.x += w+2; self.row = max(self.row, h+2)
                 self.usedx = max(self.usedx, self.x); self.usedy = max(self.usedy, self.y+self.row)
@@ -88,6 +106,16 @@ def add_runtime(parent, directory: Path, name='RobloxPortKit'):
             item(root, 'ModuleScript', path.stem, path.read_text('utf8'))
     return root
 
+def add_texture_materials(parent, textures: dict, name='TextureMaterials'):
+    """Bake immutable material properties that LocalScripts cannot assign."""
+    folder=item(parent,'Folder',name)
+    for key,uri in sorted(textures.items(),key=lambda pair:str(pair[0])):
+        material=item(folder,'SurfaceAppearance',str(key))
+        properties=material.find('Properties')
+        ET.SubElement(properties,'token',name='AlphaMode').text='1'
+        ET.SubElement(ET.SubElement(properties,'Content',name='ColorMap'),'url').text=uri
+    return folder
+
 def emit_package(destination: Path, directory: Path):
     root = ET.Element('roblox', version='4')
     add_runtime(root, directory)
@@ -97,7 +125,7 @@ def emit_package(destination: Path, directory: Path):
 
 def sync_vendor(sdk: Path, destination: Path):
     """Explicit local vendoring; ordinary consumer builds never consult a sibling checkout."""
-    files = list((sdk/'runtime').glob('*.luau')) + [sdk/'tools/portkit_bake.py', sdk/'README.md'] + list((sdk/'tests').glob('*.*'))
+    files = list((sdk/'runtime').glob('*.luau')) + list((sdk/'tools').glob('*.py')) + list((sdk/'tools').glob('*.luau')) + [sdk/'README.md'] + list((sdk/'tests').glob('*.*'))
     manifest = {'format': 1, 'files': {}}
     for source in files:
         rel = source.relative_to(sdk)

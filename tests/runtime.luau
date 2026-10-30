@@ -5,20 +5,164 @@ local function test(name, callback)
 	local ok, message = pcall(callback); assert(ok, name .. ": " .. tostring(message))
 	total += 1; print("PASS", name)
 end
-local globals = {Vector2 = roblox.Vector2, UDim = roblox.UDim, Color3 = roblox.Color3,
-	Enum = {ResamplerMode = {Pixelated = "Pixelated"}}, Content = {fromObject = function(image) return image end}}
+local globals = {Vector2 = roblox.Vector2, UDim2 = roblox.UDim2, UDim = roblox.UDim, Color3 = roblox.Color3,
+	Enum = {ResamplerMode = {Pixelated = "Pixelated"}}, Content = {fromObject = function(image) return image end,none='empty'}}
 local function load(name)
 	local fn, message = loadstring(fs.readFile("runtime/" .. name .. ".luau"), name); assert(fn, message)
 	setfenv(fn, setmetatable(globals, {__index = getfenv()})); return fn()
 end
+globals.script={Parent=setmetatable({},{__index=function(_,name)return name end})};globals.require=load
+test('native payload decoding validates declared sizes',function()
+    local payload=load('Payload')
+    globals.Enum.CompressionAlgorithm={Zstd='zstd'}
+    local service={Base64Decode=function(_,text)return text end,
+        GetDecompressedBufferSize=function()return 3 end,DecompressBuffer=function()return buffer.fromstring('abc')end}
+    assert(buffer.tostring(payload.decode('test',{bytes=3,compression='zstd'},nil,service))=='abc')
+    assert(not pcall(payload.decode,'test',{bytes=9,compression='zstd'},nil,service))
+end)
 for _, file in fs.readDir("runtime") do test("syntax " .. file, function() assert(loadstring(fs.readFile("runtime/" .. file))) end) end
+test('preloader batches deduplicated assets and preserves progress', function()
+    local created, batches = {}, {}
+    local scheduler = {spawn=function(fn) fn() end, wait=function() end}
+    local provider = {PreloadAsync=function(_, batch, callback)
+        batches[#batches+1]=#batch
+        for _, object in batch do callback(object.SoundId or object.Image, 'Success'); callback(object.SoundId or object.Image, 'Success') end
+    end}
+    local p=load('Preloader').new({headless=true, contentProvider=provider, scheduler=scheduler, batchSize=2,
+        instanceFactory=function(class) local object={class=class,Destroy=function(self) self.destroyed=true end};created[#created+1]=object;return object end})
+    local result=p:preload({sounds={'a','a','b'},images={'c','a'}})
+    assert(result.total==3 and result.completed==3 and result.status=='complete')
+    assert(#batches==2 and batches[1]==2 and batches[2]==1 and p.target==.85)
+    p:setStage('Initialize',.9);p:setStage('Earlier',.2);assert(p.target==.9)
+    p:finish();assert(p.destroyed and p.target==1)
+    for _, object in created do assert(object.destroyed) end
+end)
+test('preloader timeout and late callbacks are safe', function()
+    local pending, callback
+    local scheduler={spawn=function(fn) pending=fn end,wait=function() end}
+    local p=load('Preloader').new({headless=true,timeoutSec=.001,scheduler=scheduler,
+        instanceFactory=function() return {Destroy=function()end} end,
+        contentProvider={PreloadAsync=function(_, batch, cb) callback=cb end}})
+    local result=p:preload({sounds={'a'}});assert(result.status=='timeout' and result.completed==0)
+    pending();callback('a','Success');assert(result.completed==0 and p.target==0)
+    p:fail('Unable to load');p:finish();assert(p.failed and not p.destroyed);p:destroy()
+end)
 local Input = load("Input")
+test("shell settings button follows configured input policy", function()
+	globals.Enum.UserInputType = {Touch = "Touch", Keyboard = "Keyboard"}
+	local shell = load("Shell")
+	local touch, keyboard = globals.Enum.UserInputType.Touch, globals.Enum.UserInputType.Keyboard
+	assert(shell.settingsButtonVisible(nil, false, keyboard))
+	assert(shell.settingsButtonVisible(true, false, keyboard))
+	assert(not shell.settingsButtonVisible(false, true, touch))
+	assert(shell.settingsButtonVisible("TouchOnly", true, touch))
+	assert(not shell.settingsButtonVisible("TouchOnly", true, keyboard))
+	assert(not shell.settingsButtonVisible("TouchOnly", false, touch))
+end)
+test("shell CoreGui defaults, chat policy and overrides", function()
+	local shell = load("Shell")
+	globals.Enum.CoreGuiType = {Backpack = "Backpack", Health = "Health", EmotesMenu = "EmotesMenu", PlayerList = "PlayerList", Chat = "Chat"}
+	local scheduler = {spawn = function(fn) fn() end, wait = function() end}
+	local function run(options)
+		local calls, configs = {}, {}
+		for _, name in {"ChatWindowConfiguration", "ChatInputBarConfiguration", "BubbleChatConfiguration"} do configs[name] = {Enabled = true} end
+		options.scheduler = scheduler
+		options.starterGui = {SetCoreGuiEnabled = function(_, kind, enabled) calls[kind] = enabled end}
+		options.textChatService = {FindFirstChildOfClass = function(_, name) return configs[name] end}
+		shell.configureCoreGui(options)
+		return calls, configs
+	end
+	local calls, configs = run({})
+	for _, name in {"Backpack", "Health", "EmotesMenu", "PlayerList"} do assert(calls[name] == false) end
+	assert(calls.Chat == nil and configs.ChatWindowConfiguration.Enabled)
+	for _, options in {{singlePlayer = true}, {chat = false}, {singlePlayer = true, chat = false, coreGui = {Chat = true}}} do
+		calls, configs = run(options); assert(calls.Chat == false)
+		for _, item in configs do assert(item.Enabled == false) end
+	end
+	calls, configs = run({singlePlayer = true, chat = true, coreGui = {Backpack = true, Chat = false}})
+	assert(calls.Backpack == true and calls.Chat == nil and configs.BubbleChatConfiguration.Enabled)
+	calls = run({coreGui = {Chat = false, PlayerList = true}})
+	assert(calls.Chat == false and calls.PlayerList == true)
+end)
+test("shell CoreGui retries independently and stops at destruction", function()
+	local shell = load("Shell")
+	local counts, waits, warnings = {}, 0, 0
+	local previousWarn = globals.warn
+	globals.warn = function() warnings += 1 end
+	local scheduler = {spawn = function(fn) fn() end, wait = function() waits += 1 end}
+	local starter = {SetCoreGuiEnabled = function(_, kind)
+		counts[kind] = (counts[kind] or 0) + 1
+		if kind == "Health" or (kind == "Backpack" and counts[kind] < 3) then error("not ready") end
+	end}
+	shell.configureCoreGui({starterGui = starter, scheduler = scheduler})
+	assert(counts.Backpack == 3 and counts.Health == 10 and counts.PlayerList == 1 and waits == 9 and warnings == 1)
+	counts = {}; waits = 0
+	shell.configureCoreGui({starterGui = starter, scheduler = scheduler}, function() return waits == 0 end)
+	assert(counts.Health == 1 and waits == 1)
+	globals.warn = previousWarn
+end)
+test("shell suppression tolerates absent services and chat configurations", function()
+	local shell = load("Shell")
+	local oldGame = globals.game
+	globals.game = {GetService = function() error("unavailable") end}
+	shell.configureCoreGui({singlePlayer = true})
+	local chat = {FindFirstChildOfClass = function(_, name)
+		if name == "ChatWindowConfiguration" then error("unavailable") end
+		return nil
+	end}
+	shell.configureCoreGui({chat = false, textChatService = chat})
+	globals.game = oldGame
+end)
+test('binary file storage round trips bytes and preserves concurrent edits',function()
+    local B=load('Base64');local raw=''
+    for i=0,255 do raw..=string.char(i)end
+    for _,value in {'','a','ab','abc',raw}do assert(B.decode(B.encode(value))==value)end
+    assert(not B.isValid('ab=c'))
+    local F=load('FileStore');local a,b=F.new('a'),F.new('b')
+    a:write('saves/0.bin',raw);b:apply(a:snapshot());assert(b:read('saves/0.bin')==raw)
+    local sent=a:snapshot();a:write('saves/0.bin','later');a:apply(sent,sent)
+    assert(a.dirty and a:read('saves/0.bin')=='later')
+    b:write('saves/1.bin','other');a:apply(b:snapshot())
+    assert(a:read('saves/1.bin')=='other'and a:read('saves/0.bin')=='later')
+    a:delete('saves/0.bin');b:apply(a:snapshot());assert(not b:exists('saves/0.bin'))
+    assert(F.validate(a:snapshot()))
+    local invalid=a:snapshot();invalid.files['../escape']=invalid.files['saves/1.bin'];assert(not F.validate(invalid))
+end)
+test('achievement ledger validates IDs, merges monotonically and unlocks once',function()
+    local A=load('Achievements');local count=0;local definitions={{id='CH1'},{id='STRB1'}}
+    local a=A.new(definitions,function()count+=1 end)
+    assert(a:unlock('CH1') and not a:unlock('CH1') and count==1)
+    a:merge({STRB1=true});a:merge({});assert(a:has('CH1')and a:has('STRB1'))
+    local snapshot=a:snapshot();snapshot.CH1=nil;assert(a:has('CH1'))
+    assert(not A.validate({CHEAT=true},definitions));assert(not A.validate({CH1=false},definitions))
+    assert(A.validate({CH1=true},definitions))
+end)
+test('badge adapter retries failures and reports unmapped IDs',function()
+    local calls=0;local service={UserHasBadgeAsync=function()return false end,AwardBadgeAsync=function()calls+=1;return calls>1 end}
+    local b=load('AchievementBadges').new({CH1=123},service)
+    assert(#b:sync(1,{CH1=true,STRB1=true}).failed==1)
+    local result=b:sync(1,{CH1=true,STRB1=true});assert(#result.awarded==1 and #result.unmapped==1)
+    b:sync(1,{CH1=true});assert(calls==2)
+end)
 local time = 1
 local function input()
 	return Input.new({connect = false, clock = function() return time end,
 		bindings = {grab = {"ButtonL2", "ButtonR2", "Z"}, jump = {"Space", "ButtonA"}, primary = {"MouseButton1"}}})
 end
 local function event(key, z, kind) return {KeyCode = {Name = key}, Position = {X = 0, Y = 0, Z = z or 0}, UserInputType = {Name = kind or "Gamepad1"}} end
+test("controller style and focus follow input and mapping", function()
+	globals.Enum.KeyCode = {ButtonA="ButtonA"}
+	local mapped = "ButtonCross"
+	local i = Input.new({connect = false, uis = {GetStringForKeyCode = function() return mapped end}})
+	assert(i:getGamepadStyle() == "ps" and not i.ControllerHasFocus)
+	i:process("Began", event("ButtonA")); assert(i.Attached and i.ControllerHasFocus)
+	i:process("Began", event("Q", 0, "Keyboard")); assert(not i.ControllerHasFocus)
+	i:process("Changed", {KeyCode={Name="Thumbstick2"}, UserInputType={Name="Gamepad2"}, Position={X=.1,Y=.1,Z=0}}); assert(not i.ControllerHasFocus)
+	i:process("Changed", {KeyCode={Name="Thumbstick2"}, UserInputType={Name="Gamepad2"}, Position={X=.5,Y=0,Z=0}}); assert(i.ControllerHasFocus)
+	mapped="ButtonA"; i:refreshGamepadStyle(); assert(i:getGamepadStyle()=="xbox")
+	mapped="ButtonB"; i:refreshGamepadStyle(); assert(i:getGamepadStyle()=="switch")
+	i:setGamepadStyleOverride("ps"); assert(i:getGamepadStyle()=="ps"); i:setGamepadStyleOverride(nil); assert(i:getGamepadStyle()=="switch")
+end)
 test("both analog triggers honor hysteresis and digital endpoints", function()
 	for _, key in {"ButtonL2", "ButtonR2"} do
 		local i = input()
@@ -36,6 +180,32 @@ test("sources aggregate, processed releases clear, other gamepads ignored", func
 	i:process("Ended", event("Z", 0, "Keyboard"), true); assert(not i:check("grab"))
 	i:process("Began", event("ButtonL2", 1, "Gamepad2")); assert(not i:check("grab"))
 	i:process("Began", event("Space", 0, "Keyboard"), true); assert(not i:check("jump"))
+end)
+test("shell lets hosted game receive controller pause and cancel", function()
+	local shell = load("Shell")
+	globals.Enum.KeyCode = {ButtonStart = "start", ButtonB = "b"}
+	globals.Enum.UserInputState = {Begin = "begin", End = "end"}
+	globals.Enum.ContextActionResult = {Sink = "sink", Pass = "pass"}
+	local count = 0
+	local host = setmetatable({open = false, pauseHandler = function() count += 1 end}, shell)
+	assert(host:gamepadMenuAction("begin", "start") == "pass" and count == 0)
+	assert(host:gamepadMenuAction("begin", "b") == "pass")
+	host.open = true; host.setOpen = function(self, value) self.open = value end
+	assert(host:gamepadMenuAction("begin", "b") == "sink" and not host.open)
+	host.pauseHandler = nil; host.toggleMenu = function() count += 1 end
+	assert(host:gamepadMenuAction("begin", "start") == "sink" and count == 1)
+end)
+test("touch chords and sliding retain independent fingers", function()
+	local i = input(); local grab, jump = {}, {Position = {X = 5, Y = 5}}
+	i.touchButtons = {{action = "jump", button = {AbsolutePosition = {X = 0, Y = 0}, AbsoluteSize = {X = 10, Y = 10}}},
+		{action = "dash", button = {AbsolutePosition = {X = 10, Y = 0}, AbsoluteSize = {X = 10, Y = 10}}}}
+	i:setTouchAction(grab, "grab"); i:setTouchAction(jump, "jump"); i:setTouchDirection(60, 0)
+	assert(i:check("grab") and i:check("jump") and i:check("right"))
+	jump.Position.X = 15; i:moveTouchAction(jump)
+	assert(i:check("grab") and not i:check("jump") and i:check("dash") and i:check("right"))
+	jump.Position.X = 30; i:moveTouchAction(jump); assert(not i:check("dash"))
+	jump.Position.X = 5; i:moveTouchAction(jump); assert(i:check("jump"))
+	i:setTouchAction(jump, nil); i:setTouchAction(grab, nil); assert(not i:check("jump") and not i:check("grab"))
 end)
 test("buffer is time limited and consumed once", function()
 	local i = input(); time = 10; i:setSource("jump", "test", true); i:setSource("jump", "test", false)
@@ -165,6 +335,36 @@ local function signal()
 	end
 	return s
 end
+test("gamepad connection events refresh attachment and style", function()
+	local mapped, pads = "ButtonA", {}
+	local uis = {GetLastInputType=function() return {Name="Keyboard"} end,
+		GetStringForKeyCode=function() return mapped end, GetConnectedGamepads=function() return pads end}
+	for _, name in {"InputBegan", "InputChanged", "InputEnded", "WindowFocusReleased", "GamepadConnected", "GamepadDisconnected", "LastInputTypeChanged"} do uis[name] = signal() end
+	local i=Input.new({uis=uis}); assert(not i.Attached and i:getGamepadStyle()=="xbox")
+	mapped="ButtonCross"; pads={{Name="Gamepad1"}}; uis.GamepadConnected:fire(pads[1]); assert(i.Attached and i:getGamepadStyle()=="ps")
+	uis.InputBegan:fire(event("ButtonA"),false); assert(i.ControllerHasFocus)
+	mapped="ButtonB"; uis.LastInputTypeChanged:fire({Name="Gamepad2"}); assert(i:getGamepadStyle()=="switch")
+	pads={}; uis.GamepadDisconnected:fire({Name="Gamepad1"}); assert(not i.Attached and not i.ControllerHasFocus)
+	i:destroy()
+end)
+test("gamepad vibration caches writes and stops on disconnect and destroy", function()
+    globals.Enum.UserInputType = {Gamepad1={Name="Gamepad1"}, Gamepad2={Name="Gamepad2"}, Gamepad3={Name="Gamepad3"}, Gamepad4={Name="Gamepad4"}}
+    globals.Enum.VibrationMotor = {Large="large", Small="small"}
+    local calls, queries = {}, 0
+    local haptic = {IsVibrationSupported=function(_, pad) queries+=1; return pad.Name ~= "Gamepad2" end,
+        SetMotor=function(_,pad,motor,value) table.insert(calls,{pad.Name,motor,value}) end}
+    local uis = {GetLastInputType=function() return {Name="Keyboard"} end,
+        GetStringForKeyCode=function() return "ButtonA" end, GetConnectedGamepads=function() return {} end}
+    for _,name in {"InputBegan","InputChanged","InputEnded","WindowFocusReleased","GamepadConnected","GamepadDisconnected","LastInputTypeChanged"} do uis[name]=signal() end
+    local i=Input.new({uis=uis,hapticService=haptic})
+    assert(i:setVibration(0,.5,1)); assert(#calls==2 and queries==1)
+    assert(i:setVibration(0,.5,1)); assert(#calls==2 and queries==1)
+    assert(not i:setVibration(1,1,1)); assert(not i:setVibration(1,1,1)); assert(queries==2 and #calls==2)
+    uis.GamepadDisconnected:fire(globals.Enum.UserInputType.Gamepad1)
+    assert(#calls==4 and calls[3][3]==0 and calls[4][3]==0)
+    assert(i:setVibration(0,1,0)); assert(queries==3 and #calls==5)
+    i:destroy(); assert(#calls==6 and calls[6][3]==0)
+end)
 test("connected mouse and touch events cancel on window focus loss", function()
 	for _, kind in {"MouseButton1", "Touch"} do
 		local uis = {GetLastInputType = function() return {Name = kind} end}
@@ -245,33 +445,388 @@ test("Kit exposes Stepper and createApp wires optional clock and virtual canvas 
 end)
 local Atlas = load("AtlasPool")
 local function image() return {WritePixelsBuffer = function() end, Destroy = function(self) self.destroyed = true end} end
+test('editable staging is denied by default; shared opt-in counts successful creations',function()
+    local Policy=load('EditableImagePolicy');local Static=load('StaticImagePool')
+    local calls=0
+    local service={CreateEditableImage=function()calls+=1;return image()end,
+        CreateDataModelContentAsync=function()return 'ok',{} end}
+    local forbidden=Static.new({service=service,success='ok'})
+    local asset={uri='rbxassetid://123'};assert(forbidden:import('published',asset,1,1).content==asset)
+    local ok,err=pcall(forbidden.request,forbidden,'raw',1,1,buffer.create(4))
+    assert(not ok and tostring(err):find('EditableImage is disabled',1,true) and calls==0)
+    assert(forbidden.pending==0 and forbidden.editableImagePolicy.editableImagesCreated==0)
+    local atlas=Atlas.new({create=function()calls+=1;return image()end})
+    ok,err=pcall(atlas.acquire,atlas,'raw',1,1,buffer.create(4))
+    assert(not ok and tostring(err):find('EditableImage is disabled',1,true) and calls==0)
+    local shared=Policy.new({allowEditableImages=true});local deferred
+    local staged=Static.new({editableImagePolicy=shared,service=service,success='ok',
+        scheduler={defer=function(fn)deferred=fn end,wait=function()end}})
+    local retained=Atlas.new({editableImagePolicy=shared,create=function()calls+=1;return image()end})
+    staged:request('one',1,1,buffer.create(4));deferred()
+    retained:acquire('two',1,1,buffer.create(4))
+    assert(calls==2 and shared.editableImagesCreated==2)
+    staged:destroy();retained:destroy();assert(shared.editableImagesCreated==2)
+end)
+test('static pages stage once outside render and release editable memory',function()
+    local Static=load('StaticImagePool');local deferred,created={},{}
+    local service={CreateEditableImage=function()local im=image();created[#created+1]=im;return im end,
+        CreateDataModelContentAsync=function(_,im)return 'ok',{immutable=im}end}
+    local p=Static.new({service=service,success='ok',maxBytes=80,maxPages=10,allowEditableImages=true,
+        scheduler={defer=function(fn)deferred[#deferred+1]=fn end,wait=function()end}})
+    local decodes=0;local function pixels()decodes+=1;return buffer.create(16)end
+    assert(p:request('a',2,2,pixels)==nil and #created==0 and p.pending==1)
+    assert(p:request('a',2,2,pixels)==nil and p.pending==1 and #deferred==1)
+    deferred[1]();assert(decodes==1 and created[1].destroyed and p.pending==0 and p.bytes==16)
+    local entry=p:request('a',2,2,pixels);assert(entry==p.images.a and decodes==1)
+    p:pin('a');p:pin('a');p:unpin('a');assert(p.pins.a==1)
+    p:request('b',4,4,buffer.create(64));deferred[2]()
+    p:request('c',4,4,buffer.create(64));deferred[3]()
+    assert(p.images.a and p.images.c and not p.images.b and p.evictions==1 and p.bytes==80)
+    p:destroy();assert(p.bytes==0 and not next(p.images))
+end)
+test('static conversion failures release staging and propagate to consumers',function()
+    local Static=load('StaticImagePool');local run;local im=image()
+    local p=Static.new({allowEditableImages=true,service={CreateEditableImage=function()return im end,
+        CreateDataModelContentAsync=function()return 'failure' end},success='ok',
+        scheduler={defer=function(fn)run=fn end,wait=function()end}})
+    p:request('a',1,1,buffer.create(4));run()
+    assert(im.destroyed and p.count==0 and p.pending==0)
+    assert(#p.errors==1 and p.errors[1]:find('Static image conversion failed',1,true))
+    local ok,err=pcall(function()p:request('a',1,1,buffer.create(4))end)
+    assert(not ok and tostring(err):find('Static image conversion failed',1,true))
+end)
+test('published immutable pages bypass editable allocation and decoding',function()
+    local Static=load('StaticImagePool')
+    local p=Static.new({service={CreateEditableImage=function()error('Published page must not stage pixels')end},success='ok',maxPages=1})
+    local content={uri='published'};local a=p:import('source:1',content,1024,512)
+    assert(a.content==content and a.published and p.bytes==0 and p.uploads==0 and p.pending==0)
+    assert(p:import('source:1',content,1024,512)==a and p.count==0)
+    p:import('source:2',content,1,1)
+    assert(p.images['source:1'] and p.count==0 and not p:evict())
+end)
+test('published imports do not evict staged pages',function()
+    local Static=load('StaticImagePool');local deferred={}
+    local p=Static.new({allowEditableImages=true,service={CreateEditableImage=function()return image()end,
+        CreateDataModelContentAsync=function()return 'ok',{} end},success='ok',maxPages=64,
+        scheduler={defer=function(f)deferred[#deferred+1]=f end,wait=function()end}})
+    for i=1,64 do p:request('staged:'..i,1,1,buffer.create(4)) end
+    deferred[1]()
+    for i=1,500 do p:import('published:'..i,{uri='rbxassetid://'..i},1,1) end
+    p:import('prepared',{},1,1,function()end);deferred[2]()
+    assert(p.count==64 and p.evictions==0 and p.images.prepared)
+    for i=1,64 do assert(p.images['staged:'..i]) end
+end)
+test('published image preparation runs off-frame and retains only ready content',function()
+    local Static=load('StaticImagePool');local deferred,loads={},0
+    local p=Static.new({service={CreateEditableImage=function()error('Published pixels must not stage')end},success='ok',
+        scheduler={defer=function(f)deferred[#deferred+1]=f end,wait=function()end}})
+    local content={uri='published'};local function prepare()loads+=1 end
+    assert(not p:import('page',content,32,32,prepare)and loads==0 and p.pending==1)
+    assert(not p:import('page',content,32,32,prepare)and #deferred==1)
+    deferred[1]();assert(loads==1 and p.pending==0 and p.bytes==0 and p.uploads==0)
+    assert(p:import('page',content,32,32,prepare).content==content and loads==1)
+end)
 test("LRU evicts only unpinned and enforces hard budget", function()
-	local p = Atlas.new({maxPages = 2, create = image}); local pixels = buffer.create(16)
+	local p = Atlas.new({maxPages = 2, create = image, allowEditableImages=true}); local pixels = buffer.create(16)
 	local a = p:acquire("a", 2, 2, pixels); p:acquire("b", 2, 2, pixels); p:pin("a"); p:acquire("c", 2, 2, pixels)
 	assert(p.images.a and not p.images.b and p.count == 2 and not a.destroyed)
 	p:pin("c"); assert(not pcall(function() p:acquire("d", 2, 2, pixels) end))
 	p:releasePins(); p:destroy(); assert(p.count == 0 and a.destroyed)
 end)
+test("byte budget evicts by actual image size and retains pins", function()
+	local p = Atlas.new({maxPages = 20, maxBytes = 80, create = image, allowEditableImages=true})
+	local a = p:acquire("a", 2, 2, buffer.create(16)); p:pin("a")
+	local b = p:acquire("b", 4, 4, buffer.create(64)); assert(p.bytes == 80)
+	p:acquire("c", 4, 4, buffer.create(64))
+	assert(p.images.a and not p.images.b and b.destroyed and p.bytes == 80)
+	p:pin("c"); assert(not pcall(function() p:acquire("d", 1, 1, buffer.create(4)) end))
+	assert(not pcall(function() p:acquire("large", 5, 5, buffer.create(100)) end))
+	p:remove("c"); assert(p.bytes == 16 and p.count == 1 and not a.destroyed)
+	p:destroy(); assert(p.bytes == 0 and p.count == 0)
+end)
 test("image allocation retry, invalid sizes and failed uploads", function()
 	local fail = false
-	local p = Atlas.new({maxPages = 3, create = function() if fail then fail = false; return nil end; return image() end})
+	local p = Atlas.new({maxPages = 3, allowEditableImages=true, create = function() if fail then fail = false; return nil end; return image() end})
 	p:acquire("a", 1, 1, buffer.create(4)); fail = true; p:acquire("b", 1, 1, buffer.create(4)); assert(not p.images.a and p.images.b)
 	assert(not pcall(function() p:acquire("big", 1025, 1, buffer.create(4)) end))
 	assert(not pcall(function() p:acquire("bad", 1, 1, buffer.create(2)) end)); assert(p.count == 1)
 end)
 test("unchanged scenes write zero properties; hidden slots and styles reset", function()
-	local Scene = load("GpuScene"); local scene = Scene.new({}, function() return {Destroy = function() end} end)
+	local Scene = load("GpuScene"); local scene = Scene.new({}, function() return {Destroy = function() end} end,{imageRetentionFrames=0})
 	local props = {ImageContent = "image", ZIndex = 1, Position = "p"}
-	scene:begin(); scene:image(props); scene:frame({Size = "size"}, 4, {color = roblox.Color3.new(1, 0, 0)}); scene:finish(); assert(scene.writes > 0)
+	scene:begin(); local label=scene:image(props); scene:frame({Size = "size"}, 4, {color = roblox.Color3.new(1, 0, 0)}); scene:finish(); assert(scene.writes > 0)
 	scene:begin(); scene:image(props); scene:frame({Size = "size"}, 4, {color = roblox.Color3.new(1, 0, 0)}); scene:finish(); assert(scene.writes == 0)
-	scene:begin(); scene:frame({Size = "size"}); scene:finish(); assert(scene.images[1].object.Visible == false and not scene.frames[1].stroke.object.Enabled)
+	scene:begin(); scene:frame({Size = "size"}); scene:finish(); assert(label.Visible == false and not scene.frames[1].stroke.object.Enabled)
+	assert(label.ImageContent=='empty' and #scene.images==0,'Abandoned pages must release cached image content')
 	scene:begin(); scene:frame({Size = "size"}); scene:finish(); assert(scene.writes == 0)
+end)
+test('image labels retain their atlas content when earlier draws disappear',function()
+    local Scene=load('GpuScene');local scene=Scene.new({},function()return {Destroy=function()end}end,{imageRetentionFrames=0})
+    scene:begin();local a=scene:image({ImageContent='a',Position='a1'});local b=scene:image({ImageContent='b',Position='b1'})
+    local c=scene:image({ImageContent='c',Position='c1'});scene:finish()
+    scene:begin();assert(scene:image({ImageContent='b',Position='b2'})==b);assert(scene:image({ImageContent='c',Position='c2'})==c);scene:finish()
+    assert(a.ImageContent=='empty' and a.Visible==false)
+    scene:begin();assert(scene:image({ImageContent='new',Position='new'})~=a);assert(scene:image({ImageContent='b',Position='b3'})==b)
+    assert(scene:image({ImageContent='c',Position='c3'})==c);scene:finish()
+    assert(#scene.images==3,'Abandoned content buckets must release their instances')
+end)
+
+test('crop bindings recycle within content buckets and retain bounded inactive pages',function()
+    local Scene=load('GpuScene');local scene=Scene.new({},function()return {Destroy=function(self)self.destroyed=true end}end,
+        {maxInactiveImages=2,imageRetentionFrames=4})
+    local function props(x,w)return {ImageContent='atlas',ImageRectOffset=roblox.Vector2.new(x,1),ImageRectSize=roblox.Vector2.new(w,12)}end
+    local body,hair=props(20,13),props(40,5)
+    scene:begin();local a=scene:image(hair);local b=scene:image(body);scene:finish()
+    scene:begin();assert(scene:image(body)==b);scene:finish();assert(not a.Visible and a.Parent==nil and a.ImageContent=='atlas')
+    scene:begin();assert(scene:image(hair)==a);local flip=scene:image(props(33,-13));scene:finish()
+    assert(flip~=b and not b.Visible and flip.ImageRectSize.X==-13,'A previous visible crop must cool down')
+    scene:begin();local current=scene:image(body);scene:finish();assert(current.ImageRectSize.X==13)
+    scene:begin();scene:image(body);scene:image(props(99,13));scene:finish()
+    local created=scene.createdImages
+    for i=1,180 do scene:begin();scene:image(body);scene:image(props(100+i,13));scene:finish();assert(#scene.images==3)end
+    assert(scene.createdImages==created and scene.destroyedImages==0 and scene.recycledImages>=179)
+    local other={ImageContent='other',ImageRectOffset=body.ImageRectOffset,ImageRectSize=body.ImageRectSize}
+    scene:begin();assert(scene:image(other)~=current);scene:finish()
+    scene:begin();scene:finish();assert(#scene.images>0,'One unused frame must retain cached animation pages')
+    for i=1,5 do scene:begin();scene:finish()end
+    assert(#scene.images==0 and next(scene.imageBuckets)==nil)
+end)
+
+test('scrolling crops use two visible high-water banks with a rendered cooldown',function()
+    local Scene=load('GpuScene');local creates,destroys=0,0
+    local s=Scene.new({},function()creates+=1;return {Destroy=function()destroys+=1 end}end)
+    for frame=1,240 do
+        s:begin()
+        for i=1,12 do s:image({ImageContent='wrap',ImageRectOffset=roblox.Vector2.new(frame+i,frame-i),
+            ImageRectSize=roblox.Vector2.new(1920-frame+i,1080+frame-i)})end
+        s:finish()
+        assert(#s.images==(if frame==1 then 12 else 24) and creates==#s.images and destroys==0)
+        assert(next(s.imageBuckets.wrap.regions)~=nil)
+        local regions=0;for _ in s.imageBuckets.wrap.regions do regions+=1 end
+        assert(regions<=24,'Obsolete crop keys must remain bounded by the two banks')
+        local shown=0;for _,e in s.images do if e.object.Visible then shown+=1;assert(e.object.Parent==s.parent)else assert(e.object.Parent==nil)end end
+        assert(shown==12)
+    end
+    local created=creates
+    s:begin();s:finish();for _,e in s.images do assert(not e.object.Visible and e.object.Parent==nil)end
+    s:begin();s:image({ImageContent='wrap',ImageRectOffset=roblox.Vector2.new(10,20),ImageRectSize=roblox.Vector2.new(30,40)});s:finish()
+    assert(creates==created and destroys==0 and s.imageCount==1)
+    local attached=0;for _,e in s.images do if e.object.Parent==s.parent then attached+=1;assert(e.object.Visible)end end
+    assert(attached==1,'Only active pooled labels belong in the rendered hierarchy')
+end)
+
+test('hidden pooled images publish complete geometry before visibility',function()
+    local Scene=load('GpuScene');local expected;local publications=0
+    local function factory()
+        local values={}
+        return setmetatable({Destroy=function()end},{__index=values,__newindex=function(_,key,value)
+            if key=='Visible' and value then
+                for _,field in {'Position','Size','ImageRectOffset','ImageRectSize'}do assert(values[field]==expected[field],'Visible preceded '..field)end
+                publications+=1
+            end
+            values[key]=value
+        end})
+    end
+    local s=Scene.new({},factory);local page={}
+    expected={ImageContent=page,Position=1,Size=2,ImageRectOffset=roblox.Vector2.new(1,2),ImageRectSize=roblox.Vector2.new(3,4),Visible=true}
+    s:begin();s:image(expected);s:finish();s:begin();s:finish()
+    expected={ImageContent=page,Position=7,Size=9,ImageRectOffset=roblox.Vector2.new(1,2),ImageRectSize=roblox.Vector2.new(3,4),Visible=true}
+    s:begin();s:image(expected);s:finish();assert(publications==2)
+    expected={ImageContent=page,Position=11,Size=13,ImageRectOffset=roblox.Vector2.new(9,8),ImageRectSize=roblox.Vector2.new(7,6)}
+    s:begin();s:image(expected);s:finish();assert(publications==3 and #s.images==2)
+end)
+test('bounded detached reserves absorb per-content visibility changes after warmup',function()
+    local Scene=load('GpuScene');local s=Scene.new({},function()return {Destroy=function()end}end,{imageReserve=4})
+    local function draw(a,b)
+        s:begin()
+        for _,pair in {{'a',a},{'b',b}}do for i=1,pair[2]do
+            s:image({ImageContent=pair[1],ImageRectOffset=roblox.Vector2.new(s.generation+i,0),ImageRectSize=roblox.Vector2.new(i,1)})
+        end end
+        s:finish()
+        local n=0;for _,e in s.images do if e.object.Parent==s.parent then n+=1;assert(e.object.Visible)end end
+        assert(n==a+b)
+    end
+    draw(1,3);local created=s.createdImages
+    for frame=1,240 do draw(if frame%2==0 then 3 else 1,if frame%2==0 then 1 else 3)end
+    assert(s.createdImages==created and s.destroyedImages==0 and #s.images<=12)
+end)
+test('keepParented locks active animation crops through long idle pauses and consumes only hidden reserves',function()
+    local Scene=load('GpuScene');local state={};local parent={}
+    local function factory()
+        local values={cropWrites=0,parentWrites=0};local object
+        object=setmetatable({Destroy=function()values.destroyed=true end},{__index=values,__newindex=function(_,key,value)
+            if key=='ImageRectOffset' or key=='ImageRectSize' then
+                assert(not values.Visible,'A visible image must never be recropped in keepParented mode')
+                values.cropWrites+=1
+            elseif key=='Parent'then values.parentWrites+=1 end
+            values[key]=value
+        end})
+        state[object]=values;return object
+    end
+    local s=Scene.new(parent,factory,{keepParented=true,imageReserve=2,cropRetentionFrames=180,maxInactiveImages=0,imageRetentionFrames=1})
+    local function props(x,z,w)
+        return {ImageContent='sprites',ImageRectOffset=roblox.Vector2.new(x,2),ImageRectSize=roblox.Vector2.new(w or 8,12),ZIndex=z}
+    end
+    s:begin();local a=s:image(props(1,10));local b=s:image(props(20,20));s:finish()
+    local created=s.createdImages;assert(created==4)
+    for _=1,180 do
+        s:begin();assert(s:image(props(20,30))==b);s:finish()
+        assert(a.Parent==parent and a.Visible and a.ImageTransparency==1 and state[a].cropWrites==2 and state[a].parentWrites==1)
+        assert(not state[a].destroyed and state[b].cropWrites==2)
+    end
+    s:begin();assert(s:image(props(1,10))==a);assert(s:image(props(20,20))==b);s:finish()
+    s:begin();local c=s:image(props(40,10,-8));local d=s:image(props(60,20));s:finish()
+    assert(c~=a and c~=b and d~=a and d~=b and c~=d)
+    assert(s.createdImages==created and s.recycledImages==2,'Only unbound reserves should be recycled')
+    s:begin();local e=s:image(props(80,30));s:finish()
+    assert(e~=a and e~=b and e~=c and e~=d and s.createdImages==created+1)
+    s:begin();assert(s:image(props(1,40))==a);assert(s:image(props(20,10))==b)
+    assert(s:image(props(40,20,-8))==c);assert(s:image(props(60,30))==d);s:finish()
+    assert(a.ZIndex==40 and b.ZIndex==10 and c.ZIndex==20 and d.ZIndex==30,'Retained crops must follow current draw order')
+    for object,values in state do assert(values.cropWrites==2 and values.parentWrites==1 and not values.destroyed)end
+    for _=1,181 do s:begin();s:finish() end
+    assert(#s.images==0 and next(s.imageBuckets)==nil,'Expired inactive crops must obey a zero image budget')
+    for _,values in state do assert(values.destroyed and values.Parent==nil and not values.Visible and values.parentWrites==2)end
+end)
+test('crop retention expires by last draw even while its atlas remains active',function()
+    local Scene=load('GpuScene')
+    for _,retention in {0,2,180}do
+        local s=Scene.new({},function()return {Destroy=function(self)self.destroyed=true end}end,
+            {keepParented=true,cropRetentionFrames=retention,imageRetentionFrames=2,maxInactiveImages=2})
+        local function props(x)return {ImageContent='sprites',ImageRectOffset=roblox.Vector2.new(x,0),ImageRectSize=roblox.Vector2.new(8,12)}end
+        -- Out-of-packed-range integer keys must retain just like packed keys.
+        s:begin();local idle=s:image(props(4096));local active=s:image(props(8));s:finish()
+        for _=1,retention do
+            s:begin();assert(s:image(props(8))==active);s:finish()
+            assert(idle.Parent==s.parent and idle.Visible and idle.ImageTransparency==1 and not idle.destroyed,'Retained crops must stay parented through the inclusive window')
+        end
+        s:begin();s:image(props(8));s:finish()
+        assert(idle.Parent==nil and not idle.Visible and not idle.destroyed,'Expired crops must detach from active buckets')
+        s:begin();assert(s:image(props(16))==idle);s:image(props(8));s:finish()
+        assert(s.createdImages==2 and s.recycledImages==1 and idle.Parent==s.parent)
+        for _=1,retention+3 do s:begin();s:image(props(8));s:finish()end
+        assert(idle.destroyed and #s.images==1,'Expired active-bucket crops must eventually release cached content')
+    end
+    for _,invalid in {-1,1.5,math.huge,0/0}do
+        assert(not pcall(function()Scene.new({},function()return {}end,{cropRetentionFrames=invalid})end))
+    end
+end)
+
+test('expired crops in active buckets obey the inactive image budget',function()
+    local s=load('GpuScene').new({},function()return {Destroy=function(self)self.destroyed=true end}end,
+        {keepParented=true,cropRetentionFrames=1,maxInactiveImages=0})
+    local function props(x)return {ImageContent='sprites',ImageRectOffset=roblox.Vector2.new(x,0),ImageRectSize=roblox.Vector2.new(8,12)}end
+    s:begin();local idle=s:image(props(0));local active=s:image(props(8));s:finish()
+    s:begin();s:image(props(8));s:finish();assert(not idle.destroyed and idle.Parent==s.parent)
+    s:begin();s:image(props(8));s:finish()
+    assert(idle.destroyed and idle.Parent==nil and #s.images==1 and active.Parent==s.parent)
+end)
+
+test('fractional edge clips alternate cooled labels with exact crops and safe publication',function()
+    for _,reserve in {0,4}do
+        local expected;local publications=0;local parentWrites=0
+        local s=load('GpuScene').new({},function()
+            local values={}
+            return setmetatable({Destroy=function()error('Moving edge clips must reuse their label')end},
+                {__index=values,__newindex=function(_,key,value)
+                    if key=='ImageRectOffset' or key=='ImageRectSize' then assert(not values.Visible,'Hide before recropping')end
+                    if key=='Visible' and value then
+                        for _,field in {'Position','Size','ImageRectOffset','ImageRectSize'}do assert(values[field]==expected[field],'Publish complete geometry before visibility')end
+                        publications+=1
+                    elseif key=='Parent' then parentWrites+=1 end
+                    values[key]=value
+                end})
+        end,{keepParented=true,imageReserve=reserve,cropRetentionFrames=180,imageRetentionFrames=600,maxInactiveImages=1024})
+        local label
+        for frame=1,90 do
+            -- RenderClip.texture for a 16x16 sprite at posX=-1-frame/100,
+            -- clipped to x>=0, with source atlas offset (100,20).
+            local left=1+frame/100
+            expected={ImageContent='stable-atlas',ImageRectOffset=roblox.Vector2.new(100+left,20),
+                ImageRectSize=roblox.Vector2.new(16-left,16),Position=frame,Size=16-left}
+            s:begin();local current=s:image(expected);s:finish()
+            assert(not label or current~=label);label=current
+            assert(label.ImageRectOffset==expected.ImageRectOffset and label.ImageRectSize==expected.ImageRectSize)
+            assert(s.createdImages<=(if reserve==0 then 3 else 6) and #s.images==s.createdImages)
+            local regions=0;for _ in s.imageBuckets['stable-atlas'].regions do regions+=1 end
+            assert(regions<=(if reserve==0 then 3 else 4),'Obsolete fractional keys must stay bounded')
+        end
+        assert(s.recycledImages>=87 and publications==90 and parentWrites==3, 'Crop cycle '..s.recycledImages..'/'..publications..'/'..parentWrites)
+    end
+end)
+
+test('scrolling integer crops alternate cooled parented labels',function()
+    local parent={};local parentWrites=0
+    local s=load('GpuScene').new(parent,function()
+        local values={}
+        return setmetatable({Destroy=function()error('Unexpected destruction')end},{__index=values,__newindex=function(_,key,value)
+            assert(key~='ScrollingCrop','Internal crop flag must not reach Roblox')
+            if key=='Parent' then parentWrites+=1 end
+            values[key]=value
+        end})
+    end,{keepParented=true,cropRetentionFrames=180})
+    local label
+    for frame=1,200 do
+        s:begin();local current=s:image({ImageContent='scroll',ScrollingCrop=true,ImageRectOffset=roblox.Vector2.new(frame,0),ImageRectSize=roblox.Vector2.new(20,20)});s:finish()
+        assert(not label or label~=current);label=current
+        assert(current.Parent==parent and current.ImageRectOffset.X==frame and s.createdImages==math.min(frame,3))
+    end
+    assert(parentWrites==3)
+end)
+
+test('fractional churn preserves retained integer crops and simultaneous moving sprites',function()
+    local s=load('GpuScene').new({},function()return {Destroy=function()end}end,
+        {keepParented=true,imageReserve=4,cropRetentionFrames=180,maxInactiveImages=0})
+    local function props(x,w)return {ImageContent='sprites',ImageRectOffset=roblox.Vector2.new(x,20),ImageRectSize=roblox.Vector2.new(w,16)}end
+    s:begin();local idle=s:image(props(100,16));s:finish()
+    local created
+    for frame=1,90 do
+        s:begin();local a=s:image(props(101+frame/100,15-frame/100))
+        local b=s:image(props(201+frame/100,15-frame/100));s:finish()
+        assert(a~=b and a~=idle and b~=idle and a.Visible and b.Visible)
+        assert(idle.Parent==s.parent and idle.Visible and idle.ImageTransparency==1 and idle.ImageRectOffset==roblox.Vector2.new(100,20))
+        if frame==3 then created=s.createdImages end
+        assert((frame<3 or s.createdImages==created) and #s.images<=7,'Moving clips must reuse labels or reserves after warmup')
+    end
+    s:begin();assert(s:image(props(100,16))==idle);s:finish()
+end)
+
+test('keepParented inactive buckets detach, obey a global budget and expire by frame age',function()
+    local Scene=load('GpuScene');local s=Scene.new({},function()return {Destroy=function(self)self.destroyed=true end}end,
+        {keepParented=true,maxInactiveImages=2,imageRetentionFrames=2})
+    s:begin();local a=s:image({ImageContent='a'});local b=s:image({ImageContent='b'});local c=s:image({ImageContent='c'});s:finish()
+    s:begin();assert(s:image({ImageContent='a'})==a);s:finish()
+    assert(a.Parent==s.parent and b.Parent==nil and c.Parent==nil and not b.Visible and not c.Visible and #s.images==3)
+    s:begin();s:finish();assert(#s.images==2 and not a.Visible and a.Parent==nil)
+    s:begin();assert(s:image({ImageContent='a'})==a);s:finish()
+    assert(#s.images==1 and a.Parent==s.parent and b.destroyed and c.destroyed)
+    for _=1,3 do s:begin();s:finish()end
+    assert(a.destroyed and #s.images==0 and next(s.imageBuckets)==nil)
+end)
+test('crop keys distinguish packed boundaries, mirrored sizes and fractional rectangles',function()
+    local Scene=load('GpuScene');local s=Scene.new({},function()return {Destroy=function()end}end,{keepParented=true})
+    local crops={{-4096,-4096,-4096,-4096},{4095,4095,4095,4095},{4096,0,8,12},{0,4096,8,12},
+        {0,0,8,12},{0,0,-8,12},{0,0,8,-12},{.5,.25,8.5,12.25},{.5001,.25,8.5,12.25}}
+    local objects={};s:begin()
+    for i,crop in crops do
+        objects[i]=s:image({ImageContent='atlas',ImageRectOffset=roblox.Vector2.new(crop[1],crop[2]),ImageRectSize=roblox.Vector2.new(crop[3],crop[4])})
+        for j=1,i-1 do assert(objects[i]~=objects[j])end
+    end
+    s:finish();s:begin()
+    for i=#crops,1,-1 do local crop=crops[i]
+        assert(s:image({ImageContent='atlas',ImageRectOffset=roblox.Vector2.new(crop[1],crop[2]),ImageRectSize=roblox.Vector2.new(crop[3],crop[4])})==objects[i])
+    end
+    s:finish();assert(s.writes==0 and s.createdImages==#crops)
 end)
 test("Fit PixelPerfect and Stretch scaling", function()
 	local Shell = load("Shell")
 	local s, w, h = Shell.computeScale(320, 180, roblox.Vector2.new(1000, 600), "Fit"); assert(s == 3.125 and w == 320 and h == 180)
 	s = Shell.computeScale(320, 180, roblox.Vector2.new(1000, 600), "PixelPerfect"); assert(s == 3)
 	s, w, h = Shell.computeScale(320, 180, roblox.Vector2.new(1000, 600), "Stretch"); assert(w * s == 1000 and h * s == 600)
+	for _,size in {roblox.Vector2.new(1547,630),roblox.Vector2.new(1024,417),roblox.Vector2.new(844,390)} do
+		s,w,h=Shell.computeScale(1920,1080,size,"Stretch")
+		assert(math.abs(w*s-size.X)<1e-6 and math.abs(h*s-size.Y)<1e-6,'Stretch must fill both axes without cropping')
+	end
 end)
 local Server = load("SaveServer")
 local function clone(t) local out = {}; for k, v in t do out[k] = if type(v) == "table" then clone(v) else v end; return out end
@@ -303,14 +858,16 @@ test("failed loads never write and failed commits flush pending", function()
 	failSave = false; assert(s:flush("u1").ok and not s.sessions.u1.pending)
 end)
 test("client retains failed payload sequence and marks Studio offline honestly", function()
-	local Client = load("SaveClient"); local fail = false; local seen = {}; local applied
+	local Client = load("SaveClient"); local fail = false; local seen = {}; local applied;local busy={}
 	local c = Client.new({isStudio = true, snapshot = function() return {value = 7} end, apply = function(data, sent) applied = sent end,
+		onBusy=function(value)table.insert(busy,value)end,
 		remote = {InvokeServer = function(_, request)
 			table.insert(seen, request); if fail then error("offline") end
 			return {ok = true, data = {}, revision = 2}
 		end}})
 	assert(c:sync()); fail = true; assert(not c:sync()); assert(c.lastStatus:match("Studio"))
 	fail = false; assert(c:sync()); assert(seen[2] == seen[3] and applied.value == 7)
+	assert(#busy==6 and busy[1] and not busy[2] and busy[3] and not busy[4] and busy[5] and not busy[6])
 end)
 test("rolling stats and native stripping", function()
 	local Benchmark = load("Benchmark"); local b = Benchmark.new(3)
@@ -318,5 +875,87 @@ test("rolling stats and native stripping", function()
 	local s = b:stats(); assert(s.samples == 3 and s.meanMs == 2 and s.p50Ms == 2 and s.p95Ms == 3 and s.maxMs == 3)
 	assert(math.abs(s.observedRenderFPS - 240) < .001)
 	assert(Benchmark.stripNative("--!native\nreturn 1") == "return 1")
+end)
+test('audio slices recycle, wrap and preserve silent timelines',function()
+    local Pool=load('AudioPool');local now=0;local sounds={}
+    local function factory()
+        local s={TimePosition=0};function s:Play()self.playing=true end;function s:Stop()self.playing=false;self.TimePosition=0 end
+        function s:Pause()self.playing=false end;function s:Resume()self.playing=true end;function s:Destroy()self.destroyed=true end
+        table.insert(sounds,s);return s
+    end
+    local pool=Pool.new({parent={},factory=factory,clock=function()return now end,catalog={
+        one={uri='rbxassetid://1',startSec=3,lengthSec=2,volume=.5},
+        loop={uri='rbxassetid://1',startSec=10,lengthSec=2,loopStartSec=10.5,loop=true},
+        silent={disabled=true}}})
+    local h=pool:play('one',{});h:start();local sound=h.sound;assert(sound.TimePosition==3)
+    h:volume(.4);h:pitch(1.5);assert(sound.Volume==.2 and sound.PlaybackSpeed==1.5)
+    h:pause(true);assert(not sound.playing);h:pause(false);assert(sound.playing)
+    sound.TimePosition=5;pool:update();assert(h:state()==2 and #pool.free==1)
+    local loop=pool:play('loop',{});assert(loop.sound==sound);loop:start();sound.TimePosition=12.25;pool:update()
+    assert(math.abs(sound.TimePosition-10.75)<.00001);loop:seek(1000);assert(sound.TimePosition==11)
+    local count=#sounds;local ok,err=pcall(pool.play,pool,'missing',{})
+    assert(ok and err.stopped and #pool.errors==1 and #sounds==count,'Missing bindings must report and stop before sound creation')
+    local silent=pool:play('silent',{oneshot=true,lengthMs=1000});silent:start();now=.5;pool:update();assert(silent:state()==0)
+    silent:pause(true);now=4;pool:update();assert(silent:state()==0);silent:pause(false);now=4.6;pool:update();assert(silent:state()==2)
+    pool:destroy();assert(sound.destroyed)
+end)
+test("teleport gate allows direct joins, same-owner groups, explicit allowlists, and kicks unauthorized hubs", function()
+	local TeleportGate = load("TeleportGate")
+	local warnings = {}
+	local lookups = 0
+	local placeCreators = {
+		[111111] = {Creator = {CreatorType = "Group", Id = 1, CreatorTargetId = 521478388}},
+		[222222] = {Creator = {CreatorType = "Group", Id = 2, CreatorTargetId = 987654}},
+		[333333] = {Creator = {CreatorType = "Group", Id = 3, CreatorTargetId = 666666}},
+	}
+	local gate = TeleportGate.new({
+		isStudio = false,
+		gameId = 10773605904,
+		placeId = 131388266857137,
+		creatorType = {Name = "Group"},
+		creatorId = 521478388,
+		allowedPlaceIds = {444444},
+		allowedUniverseIds = {555555},
+		allowedGroupIds = {987654},
+		onWarn = function(msg) table.insert(warnings, msg) end,
+		getPlaceInfo = function(placeId)
+			lookups += 1
+			if placeId == 777777 then error("http timeout") end
+			return placeCreators[placeId]
+		end,
+	})
+	local function mockPlayer(userId, joinData)
+		local p = {UserId = userId, kicked = nil}
+		function p:GetJoinData() return joinData end
+		function p:Kick(reason) self.kicked = reason end
+		return p
+	end
+
+	local directPlayer = mockPlayer(10, {TeleportData = nil})
+	local ok1, reason1 = gate:checkPlayer(directPlayer)
+	assert(ok1 and reason1 == "direct" and not directPlayer.kicked and gate:isAuthorized(directPlayer))
+
+	local internalPlayer = mockPlayer(11, {SourceGameId = 10773605904, SourcePlaceId = 999999})
+	local ok2, reason2 = gate:checkPlayer(internalPlayer)
+	assert(ok2 and reason2 == "same_experience" and lookups == 0)
+
+	local ownGroupPlayer1 = mockPlayer(12, {SourceGameId = 1001, SourcePlaceId = 111111})
+	local ownGroupPlayer2 = mockPlayer(13, {SourceGameId = 1001, SourcePlaceId = 111111})
+	assert(gate:checkPlayer(ownGroupPlayer1) and lookups == 1)
+	assert(gate:checkPlayer(ownGroupPlayer2) and lookups == 1)
+
+	assert(gate:checkPlayer(mockPlayer(14, {SourceGameId = 1002, SourcePlaceId = 222222})) and lookups == 2)
+	assert(gate:checkPlayer(mockPlayer(15, {SourceGameId = 1003, SourcePlaceId = 444444})) and lookups == 2)
+	assert(gate:checkPlayer(mockPlayer(16, {SourceGameId = 555555, SourcePlaceId = 888888})) and lookups == 2)
+
+	local hubPlayer = mockPlayer(17, {SourceGameId = 6000, SourcePlaceId = 333333})
+	local okHub, reasonHub = gate:checkPlayer(hubPlayer)
+	assert(not okHub and reasonHub == "unauthorized_teleport" and hubPlayer.kicked and not gate:isAuthorized(hubPlayer))
+
+	local errPlayer = mockPlayer(18, {SourceGameId = 7000, SourcePlaceId = 777777})
+	local okErr = gate:checkPlayer(errPlayer)
+	assert(not okErr and errPlayer.kicked and not gate:isAuthorized(errPlayer) and #warnings >= 2)
+	gate:clearPlayer(errPlayer)
+	assert(gate:isAuthorized(errPlayer))
 end)
 print("PortKit runtime checks:", total)

@@ -12,6 +12,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'tools'))
 from portkit_bake import AtlasPacker, write_blob, emit_package, strip_native, sync_vendor
 
 class BakeTests(unittest.TestCase):
+    def test_gutters_use_neighboring_texels_at_every_chunk_edge(self):
+        width,height=9,7
+        raw=bytes(c for y in range(height)for x in range(width)for c in (x*20,y*30,17,128+x))
+        packer=AtlasPacker(6);parts=packer.add(width,height,raw);packer.flush()
+        for part in parts:
+            page=packer.pages[part['page']-1]
+            for y in range(-1,part['h']+1):
+                for x in range(-1,part['w']+1):
+                    sx=max(0,min(width-1,part['fx']+x));sy=max(0,min(height-1,part['fy']+y))
+                    a=((part['y']+y)*page['w']+part['x']+x)*4;b=(sy*width+sx)*4
+                    self.assertEqual(page['pixels'][a:a+4],raw[b:b+4])
+
     def test_roundtrip_oversized_atlas(self):
         for width, height in [(1,1),(31,7),(1500,11),(11,1500)]:
             raw = random.Random(width+height).randbytes(width*height*4)
@@ -40,6 +52,16 @@ class BakeTests(unittest.TestCase):
         for size in (0,1025):
             with self.assertRaises(ValueError): AtlasPacker(size)
         with self.assertRaises(ValueError): AtlasPacker().add(2,2,b'bad')
+
+    def test_native_zstd_payload_roundtrip(self):
+        from compression import zstd
+        with tempfile.TemporaryDirectory() as directory:
+            out=Path(directory);manifest={};raw=random.Random(9).randbytes(400000)
+            write_blob(out,'NativeData',raw,manifest,compression='zstd')
+            entry=manifest['NativeData'];self.assertEqual(entry['compression'],'zstd')
+            data=''.join(json.loads((out/(name+'.luau')).read_text()[7:]) for name in entry['chunks'])
+            self.assertEqual(zstd.decompress(base64.b64decode(data)),raw)
+            self.assertTrue(all((out/(name+'.luau')).stat().st_size<180000 for name in entry['chunks']))
 
     def test_package_and_vendor(self):
         sdk=Path(__file__).resolve().parents[1]

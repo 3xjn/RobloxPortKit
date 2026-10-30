@@ -1,5 +1,12 @@
 # RobloxPortKit
 
+## Phase 1 Asset Pipeline: Upfront Upload, Pruning, and Moderation Curation
+
+- **Publish static art upfront.** Upload every static texture page to `rbxassetid://` before normal gameplay, and deliver it to GPU sprite and mesh draws through `Content.fromUri`. URI resolution can take less than 0.001 ms and uses no EditableImage budget; this is not a guarantee of asset download, loading, or GPU residency time. Never leave static game sheets on the runtime ModuleScript decompression fallback path in production. Hundreds of megabytes of static art in ReplicatedStorage ModuleScripts can cause 5-15 ms main-thread decompression and `WritePixelsBuffer` stalls during room or menu transitions, evict legitimate dynamic caches from `StaticImagePool`, and hit Roblox Cloud HTTP 413 place-size limits. These timings are observed examples, not universal guarantees.
+- **Keep dynamic staging, and test it.** Runtime CPU decompression and EditableImage staging through `StaticImagePool` remain essential for truly dynamic or CPU-synthesized surfaces, such as runtime-baked tile grids, dynamic bitmap text caches, and procedural masks. Cover this path with targeted SDK tests.
+- **Choose CPU pruning independently of GPU delivery.** Use `prune: true` for pure-GPU pages, such as backgrounds, illustrations, 3D mesh textures, UI, and portraits, to remove their compressed ModuleScript chunks from build output. Use `prune: false` for mixed pages that need CPU pixel readback, such as tilemap autotilers, 1x1 texel samplers, and silhouette masks: render the same pages via `rbxassetid://` on the GPU while retaining only the required CPU chunk data. Apply these settings in the consumer's asset pipeline.
+- **Curate before batch upload.** Run an automated scan and crop audit of decals, posters, portraits, dialog art, and audio for potential Roblox terms and moderation issues, including bikini or beachwear posters, gore, alcohol or tobacco signage, profanity, and copyrighted music. Review flagged material; an automated scan alone cannot establish compliance or rights. Rather than deleting level art, restyle sensitive sprites in the same pixel-art or original art style and palette. Always show the user a before-and-after preview and obtain approval before patching and uploading the restyled assets.
+
 Reusable client shell, input, GPU scene and cloud-save infrastructure for Roblox
 ports. PortKit owns platform behavior; each game owns simulation, assets and its
 save schema. No game cheats or chapter-skipping UI are provided.
@@ -19,6 +26,48 @@ other runtime modules as children. Do not include the optional `.server.luau`
 launcher as a child of a running client SDK.
 
 ## Client
+
+`disableBackpack` defaults to `true`. Set it to `false`, or set
+`coreGui.Backpack = true`, to opt into Roblox's inventory. Suppression also
+owns a priority-3500 Backquote action; retain the cleanup function returned by
+`Shell.configureCoreGui(config, isAlive)` when hosting without `Shell.new`.
+Pass `playerGui` for landscape orientation; the local player's touch movement
+mode is set to Scriptable. Shell destruction releases all owned actions.
+
+`pauseKeys` defaults to Tab and Backquote when the backpack is disabled, and
+Tab otherwise. A configured key calls the hosted `shell.pauseHandler`, or
+toggles the shell menu. Text-box focus passes the key through. Configured pause
+keys are consumed so Tab cannot also activate a game's journal. Physical Escape
+remains reserved by Roblox; games should expose a pause button in the safe HUD.
+
+`MobileProfile.detect({mobile, uis, viewport, maxParkedNodes, residencyWindow})`
+detects touch-only devices or a viewport short side at most 540 pixels. Its
+parked-node budget defaults to 384 on mobile and 2048 on desktop; its residency
+window defaults to 5 screens. GpuScene detects this profile at construction, or
+accepts `config.mobileProfile`. Excess parked nodes unused for 180 presentations
+become hidden and detached. Crop recycling still requires a completed hidden
+presentation. Active scrolling crops reuse bounded hidden banks without repeated
+detach/reparent writes. This is an interpreter optimization, not a native-code
+or device FPS guarantee.
+
+Touch action specs accept `position`, `size`, and `anchorPoint`. Input's
+`touchLayout` accepts `movePosition` and `moveSize`. Mount the controls inside
+`Shell.HudGui` or another ScreenGui with DeviceSafeInsets. Movement supports eight
+directions; separate fingers hold and release actions independently, including
+sliding out of and back into buttons. `touchMode = 'Auto'` follows the last input
+device, and focus loss clears held touches.
+
+`Kit.Preloader.new({title, subtitle, accentColor, secondaryColor})` displays a
+responsive startup screen. Call `preloader:preload({sounds = {...}, images =
+{...}})` before game initialization, then `setStage(label, fraction)` for boot
+milestones and `finish()` to fade out. `fail(message)` leaves an error visible.
+Preloading deduplicates URIs, uses batches of 10, and returns a result with
+`status`, `total`, `completed`, and `failures`. `timeoutSec` (default 8),
+`batchSize`, and `skipAfterSec` (default 3; false disables Skip) are configurable
+on construction. A timeout, skipped load, or failed fetch can leave assets cold;
+Roblox may also evict hidden textures after preloading. Temporary instances are
+destroyed when the preloader is destroyed. Headless consumers can inject
+`contentProvider`, `instanceFactory`, and `scheduler`.
 
 ```luau
 local Kit = require(game.ReplicatedStorage.RobloxPortKit)
@@ -45,10 +94,30 @@ local canvas = app.shell.Canvas
 `DeviceSafeInsets` enum (the API does not call it `DeviceSafeArea`). Character
 parts, including parts added after spawn, are hidden, anchored and nonphysical.
 PlayerModule controls and Roblox's Backpack, Health, PlayerList and EmotesMenu
-are disabled. The camera is scriptable, and device orientation follows landscape.
+are disabled by default. The camera is scriptable, and device orientation follows landscape.
+
+Pass `singlePlayer = true` or `chat = false` to `createApp` (or `Shell.new`)
+to hide CoreGui Chat and disable the TextChatService window, input bar and bubble
+chat. Chat is otherwise left alone; `chat = true` preserves it even in single-player
+mode. `coreGui = {Backpack = true, Health = false, EmotesMenu = false,
+PlayerList = true, Chat = false}` overrides individual CoreGui enabled states;
+omitted non-chat entries default to false. `chat` takes precedence over the Chat
+override when explicitly true or when chat is suppressed. A Chat override alone
+only affects CoreGui, not TextChatService configurations. CoreGui calls retry for
+up to ten attempts while the shell is alive. Service objects can be injected as
+`starterGui` and `textChatService` for headless testing. These settings hide UI;
+they do not disable the underlying chat service or prevent messages.
+
+For a fresh Studio place, set `StarterPlayer.EnableMouseLockOption` to false in
+Edit mode and remove the default SpawnLocation/Baseplate if your port does not
+need them. For single-player places, also disable the window, input bar and bubble
+chat configurations under TextChatService in Edit mode to avoid startup UI flashes.
+PortKit does not currently provide a Studio place setup or sync helper.
 
 `setScaleMode` accepts `Fit`, `PixelPerfect` or `Stretch`. Stretch changes the
 logical canvas size, so fill it using scale coordinates if content should stretch.
+The canvas exposes `LogicalWidth` and `LogicalHeight` attributes for renderers
+that transform a fixed-resolution command stream into the resized canvas.
 `PixelPerfect` uses integer scaling when the screen is larger than the canvas;
 smaller screens fit down proportionally instead of clipping.
 
@@ -93,6 +162,23 @@ disabling/hiding touch controls also cancels an active touch.
 
 Call `app:destroy()` when unloading. All input, camera and character listeners
 are disconnected. Destroying the viewport also tears down the shell.
+
+## Static texture pages
+
+`StaticImagePool` is for immutable atlas pages. `request(id, width, height,
+pixels)` returns a cached `{content = Content}` entry, or `nil` while a background
+job prepares it. `pixels` may be an RGBA buffer or a deferred decoding function.
+Requests for the same pending page share one job. `await(...)` is available to
+loading workers; do not call it from a frame callback.
+
+Each job creates one temporary EditableImage, writes the pixels, converts it with
+`AssetService:CreateDataModelContentAsync`, and destroys the editable allocation.
+ImageLabels and MeshParts can share the resulting immutable Content. Roblox
+controls its GPU residency; an ImageLabel is not a separate VRAM snapshot.
+`maxPages` and `maxBytes` bound cached content references; `pin`/`unpin` protect
+active pages from LRU eviction. `GpuScene` clears hidden labels' ImageContent so
+they do not retain pages that the cache has released. Use `AtlasPool` for images
+that must remain editable, such as changing render targets.
 
 ## Fixed-step simulation and tower defense / strategy
 
@@ -231,3 +317,55 @@ Celeste is the first integrated consumer. Unit tests and Studio emulation are
 regression evidence, not certification across real phones/consoles. Published
 client, physical-device, memory-pressure and successful production DataStore
 measurements must be recorded separately.
+
+`AudioPool.new({wireable=true, audioGraph=graph, ...})` creates native AudioPlayer
+sources for `AudioBusGraph`, including atlas regions and route-safe recycling.
+Supply explicit `info.bus` routes and verified DSP/property bindings; ordinary
+Sounds cannot feed Wires. Graph failures warn `[PORT-ERROR]`, record diagnostics
+and disconnect affected output. Source FMOD authoring data and acoustic parity
+remain separate requirements. See the canonical SDK's
+[mixer contracts](../xna2luau/docs/fmod-mixer.md) and
+[Phase 2 evidence](../xna2luau/docs/phase2-sdk-verification.md).
+
+GpuScene reuses unused ImageLabels across crop keys within the same immutable
+ImageContent bucket, hiding them while publishing updated geometry and crop.
+Idle labels are detached from the rendered hierarchy and retained in the bounded
+Lua pool until reused or expired; attached DataModel labels are active draws.
+`imageReserve` optionally warms detached spare labels per texture bucket (the
+Monocle graphics host uses four). Active buckets retain their high-water count;
+idle buckets expire, and the global inactive budget still caps retained objects.
+`createdImages`, `destroyedImages` and `recycledImages` expose lifetime counters.
+`StaticImagePool:import(id, content, width, height, prepare?)` leases an already published
+image without pixel decoding, EditableImage staging or editable-material clones.
+Published leases share pinning/eviction with staged pages and charge zero staging
+bytes; actual Roblox texture/GPU memory remains outside this CPU-side counter.
+An optional preparation callback runs on the pool's background queue before the
+lease becomes ready; `awaitImport` waits for that readiness without pixel staging.
+
+
+### Agent phone performance gate
+
+Run `python tools/mobile_perf_gate.py` from this repository. It runs compiled
+Jump King jumping/screen changes and Celeste Chapter Select/Prologue frames in
+Lune with codegen disabled, then replays captured GUI frames in the two assigned
+Studios only while they remain in Edit. A Play session receives only a state
+query; its game uses the interpreter/metadata results instead. `--offline`
+explicitly skips Studio. No Play controls or screen captures are used.
+
+The command prints a table and writes `.cache/mobile-perf-gate.json` plus raw
+frame samples. It reports mean/p95 CPU, 3.5x/5x phone estimates, texture metadata,
+retained image nodes, writes, net heap changes and the EditableImage policy
+counter. With Studio evidence, phone estimates use the sum of phase p95 Lune
+simulation/submission and Studio GUI replay times. This is a conservative CPU
+estimate, not paired end-to-end frame latency or measured device FPS. RGBA8
+bytes deduplicate published URIs and exclude mips, compression and driver costs.
+
+Exit 1 indicates a CPU budget/error failure; exit 2 indicates incomplete device
+evidence despite passing CPU checks. The harness never certifies live phone
+60 FPS: GPU/mesh composition, texture decode and Heavenly's full boot/mesh pin
+set are unavailable to this native-boundary fixture. Jump King's real streamer
+is swept across 166 screens for mobile/desktop pin counts. Celeste sheet counts
+cover referenced 2D sheets; the full source catalog is labeled separately.
+Heap KB/frame is net heap change and can be negative after GC; it is not an
+allocation counter. Temporary Edit GUI probes are destroyed and HTTP settings
+are restored. Re-run after publishing on actual devices for complete evidence.

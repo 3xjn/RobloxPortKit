@@ -11,4 +11,5 @@ if __name__ == '__main__':
     if args.test:
         subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'], cwd=ROOT, check=True)
         subprocess.run(['lune', 'run', 'tests/runtime.luau'], cwd=ROOT, check=True)
+        subprocess.run(['lune', 'run', 'tests/gpu_scene_retention.luau'], cwd=ROOT, check=True)
     emit_package(ROOT/'dist/RobloxPortKit.rbxmx', ROOT/'runtime')

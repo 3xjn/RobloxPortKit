@@ -1,4 +1,5 @@
 -- Server-only service. Domain validation and merge rules are supplied by each port.
+local TeleportGate = require(script.Parent.TeleportGate)
 local SaveServer = {}
 function SaveServer.new(config)
 	assert(config.store and config.blank and config.validate and config.merge, "Missing save schema")
@@ -45,6 +46,12 @@ function SaveServer.new(config)
 		session.busy = false
 		if not ok then return {ok = false, error = tostring(data)} end
 		session.data = data; session.sequence = request.sequence; session.pending = nil
+		if config.onCommitted then
+			local hookOk,hookError=pcall(config.onCommitted,key,data)
+			if not hookOk then
+				if config.onError then config.onError(hookError) else warn('Save commit hook failed: '..tostring(hookError)) end
+			end
+		end
 		return {ok = true, data = data, revision = data.revision}
 	end
 	function self:handle(key, request)
@@ -63,14 +70,29 @@ function SaveServer.new(config)
 end
 function SaveServer.start(config)
 	local players = game:GetService("Players")
+	-- These developer properties require server authority; LocalScripts must
+	-- never attempt the write (even pcall prints an engine permission warning).
+	local starter = game:GetService("StarterPlayer")
+	pcall(function() starter.DevTouchMovementMode = Enum.DevTouchMovementMode.Scriptable end)
+	pcall(function() starter.EnableMouseLockOption = false end)
+	local function configurePlayer(player)
+		pcall(function() player.DevTouchMovementMode = Enum.DevTouchMovementMode.Scriptable end)
+	end
+	players.PlayerAdded:Connect(configurePlayer)
+	for _, player in players:GetPlayers() do configurePlayer(player) end
 	local http = game:GetService("HttpService")
 	config.store = config.store or game:GetService("DataStoreService"):GetDataStore(assert(config.storeName))
 	config.guid = config.guid or function() return http:GenerateGUID(false) end
 	local service = SaveServer.new(config)
+	local gate = if config.teleportGate == false then nil else TeleportGate.start(type(config.teleportGate) == "table" and config.teleportGate or nil)
+	service.teleportGate = gate
 	local remote = config.parent:FindFirstChild(config.remoteName or "Save") or Instance.new("RemoteFunction")
 	assert(remote:IsA("RemoteFunction"), "Save remote name conflicts with a non-RemoteFunction")
 	remote.Name = config.remoteName or "Save"; remote.Parent = config.parent
-	remote.OnServerInvoke = function(player, request) return service:handle("u" .. player.UserId, request) end
+	remote.OnServerInvoke = function(player, request)
+		if gate and not gate:isAuthorized(player) then return {ok = false, error = "unauthorized teleport"} end
+		return service:handle("u" .. player.UserId, request)
+	end
 	players.PlayerRemoving:Connect(function(player) local key = "u" .. player.UserId; service:flush(key); service.sessions[key] = nil end)
 	game:BindToClose(function()
 		local waiting = 0

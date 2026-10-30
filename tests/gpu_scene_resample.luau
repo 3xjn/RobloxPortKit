@@ -1,0 +1,23 @@
+local fs=require('@lune/fs');local rbx=require('@lune/roblox')
+local fn=assert(loadstring(fs.readFile('runtime/GpuScene.luau')))
+setfenv(fn,setmetatable({Enum=rbx.Enum,UDim2=rbx.UDim2,Content={none='none'}},{__index=getfenv()}))
+local Scene=fn();local scene=Scene.new({},function()return {Destroy=function()end}end)
+local props={ImageContent='page',ImageRectOffset=rbx.Vector2.new(0,0),ImageRectSize=rbx.Vector2.new(8,8),ResampleMode=rbx.Enum.ResamplerMode.Default}
+scene:begin();local first=scene:image(props);scene:finish();assert(first.ResampleMode==rbx.Enum.ResamplerMode.Default)
+scene:begin();props.ResampleMode=nil;local second=scene:image(props);scene:finish()
+assert(rawequal(first,second) and second.ResampleMode==rbx.Enum.ResamplerMode.Pixelated,'Missing sampler must reset reused image')
+scene:begin();props.ResampleMode=rbx.Enum.ResamplerMode.Default;scene:image(props);scene:finish()
+assert(first.ResampleMode==rbx.Enum.ResamplerMode.Default,'Explicit linear sampler must win')
+scene:begin();props.ResampleMode=rbx.Enum.ResamplerMode.Pixelated;scene:image(props);scene:finish()
+assert(first.ResampleMode==rbx.Enum.ResamplerMode.Pixelated,'Explicit point sampler must win')
+scene:destroy();print('PASS reused image labels respect explicit sampler and pixelated default')
+local anchor=rbx.UDim2.fromScale(.25,.5)
+local group=Scene.new({},function()return {Destroy=function()end}end,{positionOrigin=anchor})
+local original=rbx.UDim2.new(.375,4,.625,-3)
+local localProps={ImageContent='page',Position=original}
+group:begin();local child=group:image(localProps);group:finish()
+assert(localProps.Position==original,'local positioning must not modify caller properties')
+assert(child.Position==rbx.UDim2.new(.125,4,.125,-3) and group.sourcePositions[1]==original,
+    'child position must be stored relative to the run origin')
+group:begin();assert(#group.sourcePositions==0,'per-frame source position snapshots must reset')
+group:destroy();print('PASS retained scene uses local origin without mutating caller properties')

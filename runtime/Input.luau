@@ -1,5 +1,25 @@
+--!optimize 2
 local Input = {}
 Input.__index = Input
+local function geometry(self,object)
+    if typeof(object)~='Instance' then return object.AbsolutePosition,object.AbsoluteSize end
+    local cache=self.geometryCache
+    if not cache then cache=setmetatable({},{__mode='k'});self.geometryCache=cache end
+    local entry=cache[object]
+    if not entry then
+        entry={position=object.AbsolutePosition,size=object.AbsoluteSize};cache[object]=entry
+        entry.connections={
+            object:GetPropertyChangedSignal('AbsolutePosition'):Connect(function()entry.position=object.AbsolutePosition end),
+            object:GetPropertyChangedSignal('AbsoluteSize'):Connect(function()entry.size=object.AbsoluteSize end),
+            object.AncestryChanged:Connect(function()
+                if not object:IsDescendantOf(game) then
+                    for _,connection in entry.connections do connection:Disconnect()end
+                    cache[object]=nil
+                end
+            end)}
+    end
+    return entry.position,entry.size
+end
 
 function Input.new(config)
 	config = config or {}
@@ -12,8 +32,11 @@ function Input.new(config)
 			down = false, dragging = false, startX = 0, startY = 0, deltaX = 0, deltaY = 0, cancelled = false},
 		canvas = config.canvas, canvasScale = config.canvasScale, dragDeadzone = deadzone,
 		layout = config.layout or "Platformer", pointerSecondary = false,
-		touchMode = config.touchMode or "Auto", lastType = nil}, Input)
-	if config.connect ~= false then self:connect(config) end
+		touchLayout = config.touchLayout or {},
+		touchMode = config.touchMode or "Auto", lastType = nil, uis = config.uis,
+		gamepadStyle = "xbox", gamepadStyleOverride = config.gamepadStyleOverride,
+		ControllerHasFocus = false, Attached = false, hapticService = config.hapticService, vibration = {}}, Input)
+	if config.connect ~= false then self:connect(config) else self:refreshGamepadStyle() end
 	return self
 end
 
@@ -52,6 +75,7 @@ function Input:reset()
 	self:cancelPointer()
 	table.clear(self.sources); table.clear(self.presses); table.clear(self.toggled); table.clear(self.touch)
 	self.stick = Vector2.zero; self.moveTouch = nil; self.pointerTouch = nil
+	if self.thumb then self.thumb.Position = UDim2.fromScale(.5, .5) end
 end
 function Input:setEnabled(value) self:reset(); self.enabled = value; self:updateTouchVisibility() end
 function Input:axis(negative, positive, component)
@@ -61,6 +85,58 @@ function Input:axis(negative, positive, component)
 	return if digital ~= 0 then digital else (if math.abs(analog) >= .25 then analog else 0)
 end
 
+-- XNA player indices are zero-based; Roblox gamepad types are one-based.
+function Input:setVibration(index, left, right)
+    if type(index) ~= "number" or index % 1 ~= 0 or index < 0 or index > 3 then return false end
+    local pad = Enum.UserInputType["Gamepad" .. (index + 1)]
+    local state = self.vibration[index]
+    if not state then
+        local service = self.hapticService
+        if not service then
+            local ok, result = pcall(function() return game:GetService("HapticService") end)
+            if not ok then return false end
+            service = result; self.hapticService = service
+        end
+        local ok, supported = pcall(function() return service:IsVibrationSupported(pad) end)
+        state = {supported = ok and supported == true, left = 0, right = 0}
+        self.vibration[index] = state
+    end
+    if not state.supported then return false end
+    left = math.clamp(left, 0, 1); right = math.clamp(right, 0, 1)
+    if left ~= state.left then
+        local ok = pcall(function() self.hapticService:SetMotor(pad, Enum.VibrationMotor.Large, left) end)
+        if ok then state.left = left end
+    end
+    if right ~= state.right then
+        local ok = pcall(function() self.hapticService:SetMotor(pad, Enum.VibrationMotor.Small, right) end)
+        if ok then state.right = right end
+    end
+    return true
+end
+function Input:stopVibration(index)
+    if index ~= nil then
+        if self.vibration[index] then self:setVibration(index, 0, 0) end
+    else
+        for padIndex in self.vibration do self:setVibration(padIndex, 0, 0) end
+    end
+end
+
+function Input:refreshGamepadStyle()
+	local ok, value = pcall(function() return self.uis:GetStringForKeyCode(Enum.KeyCode.ButtonA) end)
+	self.gamepadStyle = if ok and value == "ButtonCross" then "ps" elseif ok and value == "ButtonB" then "switch" else "xbox"
+end
+function Input:getGamepadStyle() return self.gamepadStyleOverride or self.gamepadStyle end
+function Input:setGamepadStyleOverride(style)
+	assert(style == nil or style == "ps" or style == "xbox" or style == "switch", "Invalid gamepad style")
+	self.gamepadStyleOverride = style
+end
+function Input:refreshGamepads()
+	local ok, pads = pcall(function() return self.uis:GetConnectedGamepads() end)
+	if ok then self.Attached = #pads > 0 end
+	if not self.Attached then self.ControllerHasFocus = false end
+	self:refreshGamepadStyle()
+end
+
 -- Same dispatch path is used for real events and deterministic regression tests.
 function Input:process(phase, event, processed)
 	local kind = event.UserInputType.Name
@@ -68,7 +144,18 @@ function Input:process(phase, event, processed)
 		if self.layout == "Pointer" then self:processTouchPointer(phase, event, processed) end
 		return
 	end
-	if kind ~= "Keyboard" and kind ~= "Gamepad1" and not kind:match("^Mouse") then return end
+	local gamepad = kind:match("^Gamepad[1-8]$") ~= nil
+	if kind ~= "Keyboard" and not gamepad and not kind:match("^Mouse") then return end
+	if self.enabled and phase ~= "Ended" then
+		if kind == "Keyboard" and phase == "Began" then self.ControllerHasFocus = false
+		elseif gamepad then
+			local keyName = event.KeyCode.Name
+			local active = phase == "Began" or (phase == "Changed" and ((keyName:match("^Thumbstick") and (event.Position.X ^ 2 + event.Position.Y ^ 2 >= .25 ^ 2)) or ((keyName == "ButtonL2" or keyName == "ButtonR2") and event.Position.Z >= .25)))
+			if active then self.ControllerHasFocus = true; self.Attached = true; self:refreshGamepadStyle() end
+		end
+	end
+	-- Gameplay bindings remain assigned to the first gamepad.
+	if gamepad and kind ~= "Gamepad1" then return end
 	local key = if kind:match("^MouseButton") then kind else event.KeyCode.Name
 	if phase == "Changed" and key == "Thumbstick1" and kind == "Gamepad1" then
 		if self.enabled then self.stick = Vector2.new(event.Position.X, -event.Position.Y) end; return
@@ -99,7 +186,7 @@ end
 
 function Input:updatePointer(position)
 	if not self.canvas then return end
-	local p, size = self.canvas.AbsolutePosition, self.canvas.AbsoluteSize
+	local p, size = geometry(self,self.canvas)
 	local x, y = (position.X - p.X) / math.max(1, size.X), (position.Y - p.Y) / math.max(1, size.Y)
 	local scale = if self.canvasScale then self.canvasScale.Scale else 1
 	local pointer = self.pointer
@@ -171,7 +258,7 @@ function Input:updateTouchVisibility()
 			for source in sources do if type(source) ~= "string" or source:match("^Touch") then self:setSource(action, source, false) end end
 		end
 		if self.pointerTouch then self:cancelPointer() end
-		self.moveTouch = nil; self.pointerTouch = nil
+		self.moveTouch = nil; self.pointerTouch = nil; table.clear(self.touch)
 	end
 end
 function Input:setTouchDirection(dx, dy)
@@ -195,10 +282,39 @@ function Input:connect(config)
 		self:_track(uis[spec[1]]:Connect(function(event, processed) self:process(spec[2], event, processed) end))
 	end
 	self:_track(uis.WindowFocusReleased:Connect(function() self:reset() end))
-	self:_track(uis.GamepadDisconnected:Connect(function() self:reset() end))
+	if uis.GamepadConnected then self:_track(uis.GamepadConnected:Connect(function(pad)
+        local index = pad and tonumber(pad.Name:match("^Gamepad([1-4])$"))
+        if index then self.vibration[index - 1] = nil end
+        self:refreshGamepads()
+    end)) end
+	self:_track(uis.GamepadDisconnected:Connect(function(pad)
+        local index = pad and tonumber(pad.Name:match("^Gamepad([1-4])$"))
+        if index then self:stopVibration(index - 1); self.vibration[index - 1] = nil end
+        self:reset(); self:refreshGamepads()
+    end))
+	self:refreshGamepads()
 	self.lastType = uis:GetLastInputType().Name
-	self:_track(uis.LastInputTypeChanged:Connect(function(kind) self.lastType = kind.Name; self:updateTouchVisibility() end))
+	self:_track(uis.LastInputTypeChanged:Connect(function(kind) self.lastType = kind.Name; if self.lastType:match("^Gamepad[1-8]$") then self:refreshGamepadStyle() end; self:updateTouchVisibility() end))
 	if config.hud then self:mountTouch(config.hud, config.layout or "Platformer", config.actions or {{action = "jump", label = "Jump"}, {action = "dash", label = "Dash"}, {action = "grab", label = "Grab"}}) end
+end
+function Input:setTouchAction(event, action)
+	local previous = self.touch[event]
+	if previous == action then return end
+	if previous then self:setSource(previous, event, false) end
+	self.touch[event] = action
+	if action then self:setSource(action, event, true) end
+end
+function Input:moveTouchAction(event)
+	if self.touch[event] == nil then return end
+	local action
+	for _, entry in self.touchButtons or {} do
+		local p, size = geometry(self,entry.button)
+		if event.Position.X >= p.X and event.Position.X < p.X + size.X and event.Position.Y >= p.Y and event.Position.Y < p.Y + size.Y then
+			action = entry.action; break
+		end
+	end
+	-- Retain ownership after leaving a button so sliding back onto one works.
+	self:setTouchAction(event, action or false)
 end
 function Input:mountTouch(hud, layout, actions)
 	self.layout = layout
@@ -220,7 +336,7 @@ function Input:mountTouch(hud, layout, actions)
 			toggle.Text = if self.pointerSecondary then "Right click: on" else "Right click: off"
 		end))
 	else
-		local zone = button("Move", "", UDim2.new(0, 18, 1, -158), UDim2.fromOffset(140, 140))
+		local zone = button("Move", "", self.touchLayout.movePosition or UDim2.new(0, 18, 1, -158), self.touchLayout.moveSize or UDim2.fromOffset(140, 140))
         zone.BackgroundTransparency = .8
         for _, cue in {{"▲", .5, .13}, {"▼", .5, .87}, {"◀", .13, .5}, {"▶", .87, .5}} do
             local arrow = Instance.new("TextLabel"); arrow.BackgroundTransparency = 1; arrow.Text = cue[1]
@@ -233,35 +349,40 @@ function Input:mountTouch(hud, layout, actions)
 		self:_track(zone.InputBegan:Connect(function(event)
 			if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and not self.moveTouch then
 				self.moveTouch = event
-				local center = zone.AbsolutePosition + zone.AbsoluteSize / 2
+				local position,size=geometry(self,zone);local center=position+size/2
 				self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
 			end
 		end))
 		self.moveZone = zone
+		self.touchButtons = {}
+		local positions = {{-18, -20, 64}, {-82, -88, 58}, {-150, -34, 52}, {-18, -158, 46}}
 		for i, spec in actions do
-            local positions = {{-18, -20, 64}, {-82, -88, 58}, {-150, -34, 52}}
             local pos = positions[i] or {-18 - (i - 1) * 68, -20, 54}
-            local b = button(spec.action, spec.label or spec.action, UDim2.new(1, pos[1], 1, pos[2]), UDim2.fromOffset(pos[3], pos[3]))
-            b.AnchorPoint = Vector2.new(1, 1)
+            local b = button(spec.action, spec.label or spec.action, spec.position or UDim2.new(1, pos[1], 1, pos[2]), spec.size or UDim2.fromOffset(pos[3], pos[3]))
+            b.AnchorPoint = spec.anchorPoint or Vector2.new(1, 1)
+			table.insert(self.touchButtons, {button = b, action = spec.action})
 
 			self:_track(b.InputBegan:Connect(function(event)
 				if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible then
-					self.touch[event] = spec.action; self:setSource(spec.action, event, true)
+					self:setTouchAction(event, spec.action)
 				end
 			end))
 		end
 	end
 	self:_track(self.uis.TouchMoved:Connect(function(event)
-		if event == self.moveTouch then local center = self.moveZone.AbsolutePosition + self.moveZone.AbsoluteSize / 2; self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y) end
+		if event == self.moveTouch then local position,size=geometry(self,self.moveZone);local center=position+size/2;self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
+		elseif self.touch[event] ~= nil then self:moveTouchAction(event) end
 	end))
 	self:_track(self.uis.TouchEnded:Connect(function(event)
 		if event == self.moveTouch then self.moveTouch = nil; self:setTouchDirection(0, 0) end
-		if self.touch[event] then self:setSource(self.touch[event], event, false); self.touch[event] = nil end
+		if self.touch[event] ~= nil then self:setTouchAction(event, nil) end
 	end))
 	self:updateTouchVisibility()
 end
 function Input:destroy()
-	self:reset(); for _, connection in self.connections do connection:Disconnect() end; table.clear(self.connections)
+	for _,entry in self.geometryCache or {} do for _,connection in entry.connections do connection:Disconnect()end end
+	self.geometryCache=nil
+	self:stopVibration(); self:reset(); for _, connection in self.connections do connection:Disconnect() end; table.clear(self.connections)
 	if self.overlay then self.overlay:Destroy() end
 end
 return Input
