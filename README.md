@@ -217,6 +217,23 @@ the finger beyond the radius (`dynamicFollow = false` disables this);
 customize the default left-screen capture area. Separate fingers hold actions
 independently, including sliding off a visible button and back on.
 
+For discrete directional buttons, use `moveMode = "Dpad"`; `dpadPosition` and
+`dpadSize` customize its frame. `moveModes = {gameplay = "Dynamic", menu = "Dpad"}`
+selects the mode per context (then `default`, then `moveMode`, then `"Fixed"`).
+`moveAxes = "Cardinal"` snaps stick movement to its dominant axis, with horizontal
+ties; `"X"` / `"Y"` also hide the unused D-pad buttons. Mode/context changes
+release fingers on controls that become hidden.
+
+For direct-touch menus alongside Platformer controls, set
+`touchLayout.pointerContexts = {"menu", "prompt_jump"}` and provide `canvas`.
+`virtualSize = Vector2.new(480, 360)` maps canvas proportions to virtual pixels,
+including unclamped coordinates outside the canvas; without it, `canvasScale`
+keeps its existing behavior. `touchLayout.allowOutsidePointer = {prompt_jump = true}`
+enables tap-anywhere prompts in that context, while `drop.inside` remains accurate.
+This option also accepts a boolean or a context map with `default = true`.
+Control-owned fingers stay separate from pointer gestures; leaving pointer-enabled
+contexts cancels the active gesture. Use `pointer` and `consumeDrop()` below.
+
 ### Pointer drag & drop
 
 `layout = "Pointer"` maps direct canvas touches to `primary` / `secondary` (with

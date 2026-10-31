@@ -367,6 +367,107 @@ test("fixed movement keeps existing center geometry and eight-way defaults", fun
 	i:setTouchContext("menu"); assert(i.moveZone.Visible)
 end)
 
+test("Platformer pointer contexts map virtual taps, drags, outside prompts and cancellation", function()
+	local i = Input.new({connect = false, layout = "Platformer", touchContext = "menu",
+		virtualSize = roblox.Vector2.new(480, 360), canvasScale = {Scale = 3},
+		canvas = {AbsolutePosition = roblox.Vector2.new(100, 50), AbsoluteSize = roblox.Vector2.new(960, 540)},
+		touchLayout = {pointerContexts = {"menu", "prompt_jump"}, allowOutsidePointer = {prompt_jump = true}}})
+	local function finger(x, y) return {UserInputType = {Name = "Touch"}, Position = {X = x, Y = y}} end
+	local tap = finger(580, 320)
+	i:process("Began", tap); assert(i.pointer.down and i:check("primary") and i.pointer.inside)
+	assert(i.pointer.virtualX == 240 and i.pointer.virtualY == 180 and i.pointer.x == .5 and i.pointer.y == .5)
+	i:process("Ended", tap, true); local drop = i:consumeDrop()
+	assert(drop.x == 240 and drop.y == 180 and drop.inside and not drop.wasDrag)
+	i:process("Began", tap); tap.Position = {X = 628, Y = 350}; i:process("Changed", tap, true)
+	assert(i.pointer.dragging and i.pointer.deltaX == 24 and math.abs(i.pointer.deltaY - 20) < .0001)
+	i:process("Ended", tap); drop = i:consumeDrop(); assert(drop.wasDrag and drop.x == 264 and drop.y == 200)
+	local outside = finger(52, 23)
+	i:process("Began", outside); assert(not i.pointerTouch and not i.pointer.down)
+	i:setTouchContext("prompt_jump"); i:process("Began", outside)
+	assert(i.pointerTouch == outside and i.pointer.down and not i.pointer.inside)
+	assert(i.pointer.x == 0 and i.pointer.y == 0 and i.pointer.virtualX == -24 and i.pointer.virtualY == -18)
+	i:process("Ended", outside); drop = i:consumeDrop(); assert(not drop.inside and drop.x == -24 and drop.y == -18)
+	i:process("Began", tap); i:setTouchContext("gameplay")
+	assert(not i.pointerTouch and not i.pointerOwner and not i.pointer.down and i.pointer.cancelled and not i:check("primary"))
+	i:process("Ended", tap); assert(not i:consumeDrop()); i:process("Began", tap); assert(not i.pointerTouch)
+	i.touchLayout.allowOutsidePointer = {default = true, menu = false}
+	i:setTouchContext("menu"); assert(not i:allowsOutsidePointer())
+	i:setTouchContext("prompt_jump"); assert(i:allowsOutsidePointer())
+	i.touchLayout.allowOutsidePointer = true; assert(i:allowsOutsidePointer())
+	i:updatePointer(outside.Position); i:beginPointer("MouseButton1"); assert(not i.pointer.down)
+	i.touchLayout.pointerContexts = {gameplay = true}; i:applyTouchContext(); assert(not i:isTouchPointerEnabled())
+	i:setTouchContext("gameplay"); assert(i:isTouchPointerEnabled())
+	i.touchLayout.allowOutsidePointer = false; assert(not i:allowsOutsidePointer())
+end)
+
+test("Cardinal movement chooses one dominant axis and horizontal ties", function()
+	local unmounted = Input.new({connect = false, touchLayout = {moveAxes = {gameplay = "X"}}})
+	unmounted:setTouchDirection(60, -60); unmounted:setTouchContext("gameplay")
+	assert(unmounted:check("right") and not unmounted:check("up"))
+	local i, _, _, counts = touchFixture({touchLayout = {moveAxes = "Cardinal"}})
+	for _, case in {{60, 40, "right", 38, 0}, {-60, 40, "left", -38, 0},
+		{40, -60, "up", 0, -38}, {40, 60, "down", 0, 38}, {30, 30, "right", 30, 0}, {-30, -30, "left", -30, 0}} do
+		i:setTouchDirection(case[1], case[2])
+		for _, direction in {"up", "down", "left", "right"} do assert(i:check(direction) == (direction == case[3])) end
+		assert(i.thumb.Position == roblox.UDim2.new(.5, case[4], .5, case[5]))
+	end
+	i:setTouchDirection(9, 9); assert(not i:check("left") and not i:check("right") and not i:check("up") and not i:check("down"))
+	assert(i.thumb.Position == roblox.UDim2.fromScale(.5, .5))
+	local before = counts(); i:setTouchDirection(9, 9); assert(counts() == before)
+end)
+
+test("context movement modes retain controls and release hidden Dpad fingers", function()
+	local i, uis, touch, counts = touchFixture({touchContext = "gameplay", touchLayout = {
+		moveModes = {gameplay = "Dynamic", menu = "Dpad", horizontal = "Dpad", default = "Fixed"},
+		moveAxes = {horizontal = "X"}, pointerContexts = {menu = true}}})
+	assert(i:resolveMoveMode() == "Dynamic" and i.moveZone.Visible and i.moveArea.Visible and not i.dpad.Visible)
+	local held = touch(125, 200); i.moveArea.InputBegan:Fire(held)
+	held.Position.X += 80; uis.TouchMoved:Fire(held); assert(i:check("right"))
+	i:setTouchContext("menu")
+	assert(i.dpad.Visible and not i.moveZone.Visible and not i.moveArea.Visible and not i.moveTouch and not i.moveOrigin and not i:check("right"))
+	-- Give each retained button independent geometry for deterministic hit tests.
+	for index, direction in {"up", "down", "left", "right"} do
+		i.dpadButtons[direction].AbsolutePosition = roblox.Vector2.new(index * 50, 0)
+		i.dpadButtons[direction].AbsoluteSize = roblox.Vector2.new(44, 44)
+		assert(i.dpadButtons[direction].Size == roblox.UDim2.fromOffset(44, 44))
+	end
+	local up, right = touch(55, 5), touch(205, 5)
+	i.dpadButtons.up.InputBegan:Fire(up); i.dpadButtons.right.InputBegan:Fire(right)
+	assert(i:check("up") and i:check("right"))
+	-- A control-owned touch cannot also become a direct canvas pointer.
+	up.UserInputType = {Name = "Touch"}; i:process("Began", up); assert(not i.pointerTouch)
+	up.Position.X = 105; uis.TouchMoved:Fire(up); assert(i:check("down") and not i:check("up") and i:check("right"))
+	up.Position.X = 400; uis.TouchMoved:Fire(up); assert(not i:check("down") and i.dpadTouches[up] == false)
+	up.Position.X = 55; uis.TouchMoved:Fire(up); assert(i:check("up"))
+	i:setTouchContext("horizontal"); assert(not i.dpadButtons.up.Visible and not i.dpadButtons.down.Visible)
+	assert(i.dpadTouches[up] == nil and not i:check("up") and i:check("right"))
+	uis.TouchMoved:Fire(up); assert(not i:check("up"))
+	uis.TouchEnded:Fire(right); assert(not i:check("right") and i.dpadTouches[right] == nil)
+	i:setTouchContext("menu"); i.dpadButtons.up.InputBegan:Fire(up); i:setTouchContext("gameplay")
+	assert(not i.dpad.Visible and i.moveArea.Visible and i.dpadTouches[up] == nil and not i:check("up"))
+	local before, created = counts(); i:setTouchContext("gameplay"); i:applyTouchContext()
+	local after, retained = counts(); assert(before == after and created == retained)
+	i:setTouchContext("other"); assert(i:resolveMoveMode() == "Fixed" and i.moveZone.Visible and not i.moveArea.Visible)
+	assert(i.moveZone.Position == roblox.UDim2.new(0, 18, 1, -158) and i.moveZone.AnchorPoint == roblox.Vector2.zero)
+	i:setTouchContext("menu"); i.dpadButtons.up.InputBegan:Fire(up); i:reset()
+	assert(not i:check("up") and next(i.dpadTouches) == nil)
+	i.dpadButtons.up.InputBegan:Fire(up); i:setTouchMode("Off")
+	assert(not i:check("up") and next(i.dpadTouches) == nil)
+end)
+
+test("Dpad base mode, context hide and pointer event order cancel ownership", function()
+	local i, uis, touch = touchFixture({touchContext = "menu", virtualSize = roblox.Vector2.new(480, 360),
+		canvas = {AbsolutePosition = roblox.Vector2.zero, AbsoluteSize = roblox.Vector2.new(480, 360)},
+		touchLayout = {moveMode = "Dpad", moveContexts = {"menu"}, pointerContexts = {"menu"}}}, {{action = "jump"}})
+	assert(i.dpad.Visible and not i.moveZone.Visible and not i.moveArea)
+	local held = touch(50, 100); held.UserInputType = {Name = "Touch"}
+	i:process("Began", held); assert(i.pointerTouch == held)
+	held.UserInputType = globals.Enum.UserInputType.Touch; i.dpadButtons.left.InputBegan:Fire(held)
+	assert(not i.pointerTouch and not i.pointer.down and not i:consumeDrop() and i:check("left"))
+	i:setTouchContext("gameplay"); assert(not i.dpad.Visible and next(i.dpadTouches) == nil and not i:check("left"))
+	i:setTouchContext("menu"); uis.TouchMoved:Fire(held); assert(not i:check("left"))
+end)
+
 test("buffer is time limited and consumed once", function()
 	local i = input(); time = 10; i:setSource("jump", "test", true); i:setSource("jump", "test", false)
 	time = 10.1; assert(i:consumeBuffer("jump", .15)); assert(not i:consumeBuffer("jump", .15))
@@ -540,6 +641,10 @@ test("connected mouse and touch events cancel on window focus loss", function()
 		i:destroy(); uis.InputBegan:fire(press, false); assert(not i.pointer.down)
 	end
 end)
+-- Run the complete input section independently of rendering regressions.
+if require("@lune/process").args[1] == "--input" then
+	print("PortKit input checks:", total); return
+end
 local Stepper = load("Stepper")
 local function close(a, b) assert(math.abs(a - b) < 1e-7, tostring(a) .. " ~= " .. tostring(b)) end
 test("fixed clock returns exact 1x and 3x ticks and fractional interpolation", function()

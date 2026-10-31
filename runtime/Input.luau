@@ -42,12 +42,15 @@ function Input.new(config)
 		connections = {}, clock = config.clock or os.clock, enabled = true,
 		pointer = {x = 0, y = 0, virtualX = 0, virtualY = 0, inside = false,
 			down = false, dragging = false, startX = 0, startY = 0, deltaX = 0, deltaY = 0, cancelled = false},
-		canvas = config.canvas, canvasScale = config.canvasScale, dragDeadzone = deadzone,
+		canvas = config.canvas, canvasScale = config.canvasScale, virtualSize = config.virtualSize, dragDeadzone = deadzone,
 		layout = config.layout or "Platformer", pointerSecondary = false,
 		touchLayout = config.touchLayout or {}, touchContext = config.touchContext or "default",
 		touchMode = config.touchMode or "Auto", lastType = nil, uis = config.uis,
 		gamepadStyle = "xbox", gamepadStyleOverride = config.gamepadStyleOverride,
 		ControllerHasFocus = false, Attached = false, hapticService = config.hapticService, vibration = {}}, Input)
+	self.pointerContextSpec = self.touchLayout.pointerContexts
+	self.pointerContexts = normalizeContexts(self.pointerContextSpec)
+	self.moveMode = self:resolveMoveMode()
 	if config.connect ~= false then self:connect(config) else self:refreshGamepadStyle() end
 	return self
 end
@@ -85,6 +88,7 @@ function Input:consumeBuffer(action, windowSeconds)
 end
 function Input:reset()
 	self:cancelPointer()
+	if self.dpadTouches then table.clear(self.dpadTouches) end
 	table.clear(self.sources); table.clear(self.presses); table.clear(self.toggled); table.clear(self.touch)
 	self.stick = Vector2.zero; self.moveTouch = nil; self.pointerTouch = nil
 	self:setTouchDirection(0, 0); self:resetMoveZone()
@@ -153,7 +157,10 @@ end
 function Input:process(phase, event, processed)
 	local kind = event.UserInputType.Name
 	if kind == "Touch" then
-		if self.layout == "Pointer" then self:processTouchPointer(phase, event, processed) end
+		if self:isTouchPointerEnabled() and event ~= self.moveTouch and self.touch[event] == nil
+			and (not self.dpadTouches or self.dpadTouches[event] == nil) then
+			self:processTouchPointer(phase, event, processed)
+		end
 		return
 	end
 	local gamepad = kind:match("^Gamepad[1-8]$") ~= nil
@@ -203,8 +210,12 @@ function Input:updatePointer(position)
 	local scale = if self.canvasScale then self.canvasScale.Scale else 1
 	local pointer = self.pointer
 	pointer.x = math.clamp(x, 0, 1); pointer.y = math.clamp(y, 0, 1)
-	pointer.virtualX = (position.X - p.X) / math.max(1e-6, scale)
-	pointer.virtualY = (position.Y - p.Y) / math.max(1e-6, scale)
+	if self.virtualSize then
+		pointer.virtualX = x * self.virtualSize.X; pointer.virtualY = y * self.virtualSize.Y
+	else
+		pointer.virtualX = (position.X - p.X) / math.max(1e-6, scale)
+		pointer.virtualY = (position.Y - p.Y) / math.max(1e-6, scale)
+	end
 	pointer.inside = x >= 0 and x <= 1 and y >= 0 and y <= 1
 	if pointer.down then
 		pointer.deltaX = pointer.virtualX - pointer.startX; pointer.deltaY = pointer.virtualY - pointer.startY
@@ -213,7 +224,7 @@ function Input:updatePointer(position)
 end
 function Input:beginPointer(owner)
 	local pointer = self.pointer
-	if not self.enabled or not pointer.inside or pointer.down then return end
+	if not self.enabled or pointer.down or (not pointer.inside and (owner == "MouseButton1" or not self:allowsOutsidePointer())) then return end
 	self.pointerOwner = owner
 	pointer.down = true; pointer.dragging = false; pointer.cancelled = false
 	pointer.startX = pointer.virtualX; pointer.startY = pointer.virtualY
@@ -236,12 +247,27 @@ end
 function Input:consumeDrop()
 	local drop = self.drop; self.drop = nil; return drop
 end
+function Input:isTouchPointerEnabled()
+	return self.layout == "Pointer" or (self.pointerContexts ~= nil and self.pointerContexts[self.touchContext] == true)
+end
+function Input:allowsOutsidePointer()
+	local spec = self.touchLayout.allowOutsidePointer
+	if type(spec) == "boolean" then return spec end
+	if type(spec) == "table" then return spec[self.touchContext] == true or (spec[self.touchContext] == nil and spec.default == true) end
+	return false
+end
+-- GUI and service events can arrive in either order; a control owns its finger.
+function Input:claimControlTouch(event)
+	if self.pointerTouch == event then
+		self:cancelPointer(); self:setSource(self.pointerAction, "TouchPointer", false); self.pointerTouch = nil
+	end
+end
 function Input:processTouchPointer(phase, event, processed)
 	if phase == "Began" then
 		if processed or not self.enabled or self.touchMode == "Off" or self.pointerTouch or self.pointer.down
 			or (self.overlay and not self.overlay.Visible) then return end
 		self:updatePointer(event.Position)
-		if not self.pointer.inside then return end
+		if not self.pointer.inside and not self:allowsOutsidePointer() then return end
 		self.pointerTouch = event; self.pointerAction = if self.pointerSecondary then "secondary" else "primary"
 		self:setSource(self.pointerAction, "TouchPointer", true)
 		if self.pointerAction == "primary" then self:beginPointer(event) end
@@ -271,6 +297,7 @@ function Input:updateTouchVisibility()
 		end
 		if self.pointerTouch then self:cancelPointer() end
 		self.moveTouch = nil; self.pointerTouch = nil; table.clear(self.touch)
+		if self.dpadTouches then table.clear(self.dpadTouches) end
 		self:setTouchDirection(0, 0); self:resetMoveZone()
 	end
 end
@@ -300,15 +327,46 @@ function Input:resolveMoveAxes()
 	if type(axes) == "table" then return axes[self.touchContext] or axes.default or "XY" end
 	return "XY"
 end
+function Input:resolveMoveMode()
+	local modes = self.touchLayout.moveModes
+	if type(modes) == "table" then return modes[self.touchContext] or modes.default or self.touchLayout.moveMode or "Fixed" end
+	return self.touchLayout.moveMode or "Fixed"
+end
+function Input:setDpadTouch(event, direction)
+	local previous = self.dpadTouches[event]
+	if previous == direction then return end
+	if previous then self:setSource(previous, event, false) end
+	self.dpadTouches[event] = direction
+	if direction then self:claimControlTouch(event); self:setSource(direction, event, true) end
+end
+function Input:moveDpadTouch(event)
+	for direction, button in self.dpadButtons do
+		if self.dpad.Visible and button.Visible then
+			local p, size = geometry(self, button)
+			if event.Position.X >= p.X and event.Position.X < p.X + size.X and event.Position.Y >= p.Y and event.Position.Y < p.Y + size.Y then
+				self:setDpadTouch(event, direction); return
+			end
+		end
+	end
+	self:setDpadTouch(event, false)
+end
 function Input:resetMoveZone()
 	self.moveOrigin = nil
-	if self.moveZone and self.touchLayout.moveMode == "Dynamic" then
+	if self.moveZone and self:resolveMoveMode() == "Dynamic" then
 		writeChanged(self.moveZone, "Position", self.moveHomePosition)
 		writeChanged(self.moveZone, "BackgroundTransparency", .86)
 		writeChanged(self.moveZone, "Visible", self.moveVisible == true and not self.touchLayout.hideIdleMove)
 	end
 end
 function Input:applyTouchContext()
+	-- Normalize only when the configuration reference changes, not per gesture.
+	if self.pointerContextSpec ~= self.touchLayout.pointerContexts then
+		self.pointerContextSpec = self.touchLayout.pointerContexts
+		self.pointerContexts = normalizeContexts(self.pointerContextSpec)
+	end
+	if not self:isTouchPointerEnabled() and self.pointerTouch ~= nil then
+		self:cancelPointer(); self:setSource(self.pointerAction, "TouchPointer", false); self.pointerTouch = nil
+	end
 	for _, entry in self.touchButtons or {} do
 		local visible = if entry.visibleOverride ~= nil then entry.visibleOverride else (entry.contexts == nil or entry.contexts[self.touchContext] == true)
 		local text = entry.labelOverride or (entry.labels and entry.labels[self.touchContext]) or entry.defaultLabel
@@ -321,17 +379,43 @@ function Input:applyTouchContext()
 		end
 	end
 	local moveVisible = self.moveContexts == nil or self.moveContexts[self.touchContext] == true
+	local mode, axes = self:resolveMoveMode(), self:resolveMoveAxes()
+	local changedMode = self.moveMode ~= mode
 	self.moveVisible = moveVisible
-	if self.moveArea then writeChanged(self.moveArea, "Visible", moveVisible) end
-	if self.moveZone then
-		writeChanged(self.moveZone, "Visible", moveVisible and (self.touchLayout.moveMode ~= "Dynamic" or self.moveTouch ~= nil or not self.touchLayout.hideIdleMove))
+	if changedMode then
+		self.moveMode = mode; self.moveTouch = nil; self.moveOrigin = nil
+		self:setTouchDirection(0, 0)
+		if self.moveZone then
+			local dynamic = mode == "Dynamic"
+			self.moveHomePosition = self.touchLayout.movePosition or (if dynamic then UDim2.new(0, 88, 1, -88) else UDim2.new(0, 18, 1, -158))
+			writeChanged(self.moveZone, "Position", self.moveHomePosition)
+			writeChanged(self.moveZone, "Size", self.touchLayout.moveSize or UDim2.fromOffset(if dynamic then 128 else 140, if dynamic then 128 else 140))
+			writeChanged(self.moveZone, "AnchorPoint", if dynamic then Vector2.new(.5, .5) else Vector2.zero)
+			writeChanged(self.moveZone, "Active", not dynamic)
+			writeChanged(self.moveZone, "BackgroundTransparency", if dynamic then .86 else .8)
+		end
 	end
-	local axes = self:resolveMoveAxes()
+	if self.moveArea then writeChanged(self.moveArea, "Visible", moveVisible and mode == "Dynamic") end
+	if self.moveZone then
+		writeChanged(self.moveZone, "Visible", moveVisible and mode ~= "Dpad" and (mode ~= "Dynamic" or self.moveTouch ~= nil or not self.touchLayout.hideIdleMove))
+	end
+	if self.dpad then writeChanged(self.dpad, "Visible", moveVisible and mode == "Dpad") end
+	for direction, button in self.dpadButtons or {} do
+		local vertical = direction == "up" or direction == "down"
+		local visible = moveVisible and mode == "Dpad" and (if vertical then axes ~= "X" else axes ~= "Y")
+		writeChanged(button, "Visible", visible)
+		if not visible then
+			for event, held in self.dpadTouches do if held == direction then self:setDpadTouch(event, nil) end end
+		end
+	end
+	if changedMode or not moveVisible or mode ~= "Dpad" then
+		for event in self.dpadTouches or {} do self:setDpadTouch(event, nil) end
+	end
 	for direction, arrow in self.moveArrows or {} do
 		local vertical = direction == "up" or direction == "down"
 		writeChanged(arrow, "Visible", if vertical then axes ~= "X" else axes ~= "Y")
 	end
-	if not moveVisible then
+	if not moveVisible or mode == "Dpad" then
 		self.moveTouch = nil; self:setTouchDirection(0, 0); self:resetMoveZone()
 	else
 		self:setTouchDirection(self.lastMoveDx or 0, self.lastMoveDy or 0)
@@ -348,6 +432,11 @@ function Input:setTouchDirection(dx, dy)
 	elseif axes == "Y" then
 		y = if math.abs(dy) >= deadzone then (if dy > 0 then 1 else -1) else 0
 		ty = math.clamp(dy, -radius, radius)
+	elseif axes == "Cardinal" then
+		if dx * dx + dy * dy >= deadzone * deadzone then
+			if math.abs(dx) >= math.abs(dy) then x = if dx > 0 then 1 else -1; tx = math.clamp(dx, -radius, radius)
+			else y = if dy > 0 then 1 else -1; ty = math.clamp(dy, -radius, radius) end
+		end
 	else
 		local angle = math.atan2(dy, dx)
 		local sector = math.floor(angle / (math.pi / 4) + .5)
@@ -388,7 +477,7 @@ function Input:setTouchAction(event, action)
 	if previous == action then return end
 	if previous then self:setSource(previous, event, false) end
 	self.touch[event] = action
-	if action then self:setSource(action, event, true) end
+	if action then self:claimControlTouch(event); self:setSource(action, event, true) end
 end
 function Input:moveTouchAction(event)
 	if self.touch[event] == nil then return end
@@ -405,6 +494,8 @@ function Input:moveTouchAction(event)
 end
 function Input:mountTouch(hud, layout, actions)
 	self.layout = layout
+	self.pointerContextSpec = self.touchLayout.pointerContexts
+	self.pointerContexts = normalizeContexts(self.pointerContextSpec)
 	local overlay = Instance.new("Frame"); overlay.Name = "TouchControls"; overlay.Size = UDim2.fromScale(1, 1)
 	overlay.BackgroundTransparency = 1; overlay.Parent = hud; self.overlay = overlay
 	local function button(name, label, position, size)
@@ -423,20 +514,25 @@ function Input:mountTouch(hud, layout, actions)
 			toggle.Text = if self.pointerSecondary then "Right click: on" else "Right click: off"
 		end))
 	else
-		local dynamic = self.touchLayout.moveMode == "Dynamic"
+		local dynamic = self:resolveMoveMode() == "Dynamic"
+		local hasDynamic, hasDpad = self.touchLayout.moveMode == "Dynamic", self.touchLayout.moveMode == "Dpad"
+		if type(self.touchLayout.moveModes) == "table" then
+			for _, mode in self.touchLayout.moveModes do
+				hasDynamic = hasDynamic or mode == "Dynamic"; hasDpad = hasDpad or mode == "Dpad"
+			end
+		end
 		self.moveContexts = normalizeContexts(self.touchLayout.moveContexts)
 		local zone = button("Move", "", self.touchLayout.movePosition or (if dynamic then UDim2.new(0, 88, 1, -88) else UDim2.new(0, 18, 1, -158)), self.touchLayout.moveSize or UDim2.fromOffset(if dynamic then 128 else 140, if dynamic then 128 else 140))
 		zone.BackgroundTransparency = if dynamic then .86 else .8
 		if dynamic then zone.AnchorPoint = Vector2.new(.5, .5); zone.Active = false end
 		self.moveHomePosition = zone.Position
-		local capture = zone
-		if dynamic then
+		if hasDynamic then
 			local moveArea = Instance.new("TextButton"); moveArea.Name = "MoveArea"; moveArea.Text = ""
 			moveArea.BackgroundTransparency = 1; moveArea.BorderSizePixel = 0
 			moveArea.Position = self.touchLayout.moveAreaPosition or UDim2.new(0, 0, .16, 0)
 			moveArea.Size = self.touchLayout.moveAreaSize or UDim2.new(.48, 0, .84, 0)
 			moveArea.ZIndex = 109; moveArea.Selectable = false; moveArea.Parent = overlay
-			self.moveArea = moveArea; capture = moveArea
+			self.moveArea = moveArea
 		end
 		self.moveArrows = {}
 		for _, cue in {{"▲", .5, .13, "up"}, {"▼", .5, .87, "down"}, {"◀", .13, .5, "left"}, {"▶", .87, .5, "right"}} do
@@ -448,9 +544,9 @@ function Input:mountTouch(hud, layout, actions)
         local thumb = Instance.new("Frame"); thumb.Size = UDim2.fromOffset(42, 42); thumb.AnchorPoint = Vector2.new(.5, .5); thumb.Position = UDim2.fromScale(.5, .5)
         thumb.BackgroundColor3 = Color3.fromRGB(202, 224, 239); thumb.BackgroundTransparency = .5; thumb.BorderSizePixel = 0; thumb.ZIndex = 112; thumb.Parent = zone
         local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = thumb; self.thumb = thumb
-		self:_track(capture.InputBegan:Connect(function(event)
+		local function beginMove(event, capture, dynamic)
 			if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and capture.Visible ~= false and not self.moveTouch then
-				self.moveTouch = event
+				self:claimControlTouch(event); self.moveTouch = event
 				if dynamic then
 					self.moveOrigin = Vector2.new(event.Position.X, event.Position.Y)
 					local overlayPos = geometry(self, overlay)
@@ -462,7 +558,29 @@ function Input:mountTouch(hud, layout, actions)
 					self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
 				end
 			end
+		end
+		self:_track(zone.InputBegan:Connect(function(event)
+			if self:resolveMoveMode() == "Fixed" then beginMove(event, zone, false) end
 		end))
+		if self.moveArea then self:_track(self.moveArea.InputBegan:Connect(function(event)
+			if self:resolveMoveMode() == "Dynamic" then beginMove(event, self.moveArea, true) end
+		end)) end
+		if hasDpad then
+			local dpad = Instance.new("Frame"); dpad.Name = "Dpad"; dpad.BackgroundTransparency = 1
+			dpad.Position = self.touchLayout.dpadPosition or UDim2.new(0, 18, 1, -158)
+			dpad.Size = self.touchLayout.dpadSize or UDim2.fromOffset(140, 140); dpad.Parent = overlay
+			self.dpad = dpad; self.dpadTouches = {}; self.dpadButtons = {}
+			for _, cue in {{"Up", "▲", .5, 0}, {"Down", "▼", .5, 1}, {"Left", "◀", 0, .5}, {"Right", "▶", 1, .5}} do
+				local direction = string.lower(cue[1])
+				local b = button("Dpad" .. cue[1], cue[2], UDim2.fromScale(cue[3], cue[4]), UDim2.fromOffset(44, 44))
+				b.AnchorPoint = Vector2.new(cue[3], cue[4]); b.Parent = dpad; self.dpadButtons[direction] = b
+				self:_track(b.InputBegan:Connect(function(event)
+					if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and dpad.Visible and b.Visible then
+						self:setDpadTouch(event, direction)
+					end
+				end))
+			end
+		end
 		self.moveZone = zone
 		self.touchButtons = {}
 		local positions = {{-18, -20, 64}, {-82, -88, 58}, {-150, -34, 52}, {-18, -158, 46}}
@@ -483,7 +601,7 @@ function Input:mountTouch(hud, layout, actions)
 	end
 	self:_track(self.uis.TouchMoved:Connect(function(event)
 		if event == self.moveTouch then
-			if self.touchLayout.moveMode == "Dynamic" then
+			if self:resolveMoveMode() == "Dynamic" then
 				local ox, oy = self.moveOrigin.X, self.moveOrigin.Y
 				local dx, dy = event.Position.X - ox, event.Position.Y - oy
 				if self.touchLayout.dynamicFollow ~= false then
@@ -510,11 +628,13 @@ function Input:mountTouch(hud, layout, actions)
 				local position, size = geometry(self, self.moveZone); local center = position + size / 2
 				self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
 			end
+		elseif self.dpadTouches and self.dpadTouches[event] ~= nil then self:moveDpadTouch(event)
 		elseif self.touch[event] ~= nil then self:moveTouchAction(event) end
 	end))
 	self:_track(self.uis.TouchEnded:Connect(function(event)
 		if event == self.moveTouch then self.moveTouch = nil; self:setTouchDirection(0, 0); self:resetMoveZone() end
 		if self.touch[event] ~= nil then self:setTouchAction(event, nil) end
+		if self.dpadTouches and self.dpadTouches[event] ~= nil then self:setDpadTouch(event, nil) end
 	end))
 	self:applyTouchContext()
 	self:updateTouchVisibility()
