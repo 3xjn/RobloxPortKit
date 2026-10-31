@@ -83,14 +83,22 @@ function Canvas:draw(sprite,x,y,flipX,flipY)
     local w,h=sprite.w,sprite.h
     if x>=W or y>=H or x+w<=0 or y+h<=0 then return end
     local runs=sprite.runs;local source=sprite.source
-    for k=1,#runs,4 do
-        local dy=runs[k+2];if flipY then dy=h-1-dy end
-        local ty=y+dy
-        if ty>=0 and ty<H then
-            local tx,len,src=x+runs[k+1],runs[k+3],runs[k]
-            if tx<0 then src-=tx*4;len+=tx;tx=0 end
-            if tx+len>W then len=W-tx end
-            if len>0 then copy(frame,(ty*W+tx)*4,source,src,len*4)end
+    -- Rows map to y+dy (or the mirrored row); fully inside rows skip clipping.
+    local base,step=y,1
+    if flipY then base,step=y+h-1,-1 end
+    if x>=0 and x+w<=W and y>=0 and y+h<=H then
+        for k=1,#runs,4 do
+            copy(frame,((base+step*runs[k+2])*W+x+runs[k+1])*4,source,runs[k],runs[k+3]*4)
+        end
+    else
+        for k=1,#runs,4 do
+            local ty=base+step*runs[k+2]
+            if ty>=0 and ty<H then
+                local tx,len,src=x+runs[k+1],runs[k+3],runs[k]
+                if tx<0 then src-=tx*4;len+=tx;tx=0 end
+                if tx+len>W then len=W-tx end
+                if len>0 then copy(frame,(ty*W+tx)*4,source,src,len*4)end
+            end
         end
     end
     local blended=sprite.blended
@@ -207,18 +215,20 @@ function Canvas:fillRect(x,y,w,h,r,g,b,a)
         for py=top,bottom-1 do for px=left,right-1 do blendPixel(frame,(py*W+px)*4,r,g,b,a)end end
     end
 end
--- Upload the frame to this canvas's EditableImage; returns its Content.
+-- Upload the frame to this canvas's EditableImage; returns its Content, or
+-- nil when the engine's EditableImage memory budget refuses a new image.
 function Canvas:upload()
     if not self.image then
-        self.image=game:GetService('AssetService'):CreateEditableImage({Size=Vector2.new(self.width,self.height)})
-        self.content=Content.fromObject(self.image);self.size=Vector2.new(self.width,self.height)
+        local image=game:GetService('AssetService'):CreateEditableImage({Size=Vector2.new(self.width,self.height)})
+        if not image then return nil end
+        self.image=image;self.content=Content.fromObject(image);self.size=Vector2.new(self.width,self.height)
     end
     self.image:WritePixelsBuffer(Vector2.zero,self.size,self.frame)
     return self.content
 end
 -- Show the frame through one EditableImage in an ImageLabel under parent.
 function Canvas:present(parent)
-    local content=self:upload()
+    local content=assert(self:upload(),'EditableImage memory budget exhausted')
     if not self.label then
         local label=Instance.new('ImageLabel');label.Name='PixelCanvas';label.BackgroundTransparency=1;label.BorderSizePixel=0
         label.Size=UDim2.fromScale(1,1);label.ResampleMode=Enum.ResamplerMode.Pixelated
