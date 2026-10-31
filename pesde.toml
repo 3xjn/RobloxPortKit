@@ -1,5 +1,5 @@
 name = "3xjn/robloxportkit"
-version = "0.3.1"
+version = "0.3.2"
 description = "Roblox runtime SDK for game ports (shell, input, GPU scene, pools, saves)"
 license = "UNLICENSED"
 includes = ["pesde.toml", "README.md", "runtime/**"]
