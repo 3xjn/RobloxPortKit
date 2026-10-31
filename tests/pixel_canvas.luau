@@ -66,4 +66,32 @@ canvas:fillRect(-3,2,20,5,200,100,50);canvas:fillRect(5,4,50,30,0,255,0,128)
 for py=2,6 do for px=0,16 do Canvas.blendPixel(ref.frame,(py*W+px)*4,200,100,50,255)end end
 for py=4,H-1 do for px=5,W-1 do Canvas.blendPixel(ref.frame,(py*W+px)*4,0,255,0,128)end end
 same(canvas.frame,ref.frame,'rectangles')
+-- Transparent layers: source-over keeps straight alpha (composited later by GUI).
+do
+    local c=Canvas.new(1,1);c:clear(0,0,0,0)
+    Canvas.blendPixel(c.frame,0,200,100,0,128)
+    assert(buffer.readu32(c.frame,0)==bit32.bor(200,bit32.lshift(100,8),bit32.lshift(128,24)),'empty destination takes the source')
+    Canvas.blendPixel(c.frame,0,0,0,200,128)
+    local a=buffer.readu8(c.frame,3);assert(math.abs(a-192)<=1,'alpha union '..a)
+    assert(math.abs(buffer.readu8(c.frame,0)-67)<=1 and math.abs(buffer.readu8(c.frame,2)-133)<=1,'straight colour mix')
+end
+-- Variants (integer placement) equal the general transformed path.
+for trial=1,200 do
+    local w,h=int(1,12),int(1,12);local sx,sy=int(0,SW-w),int(0,SW-h)
+    local sprite=Canvas.sprite(page,SW,sx,sy,w,h)
+    local angle=rand()*math.pi*2;local k=.5+rand()*2.5
+    local a,b,c,d=math.cos(angle)*k,math.sin(angle)*k,-math.sin(angle)*k,math.cos(angle)*k
+    if rand()<.3 then a,b,c,d=k,0,0,k*(if rand()<.5 then -1 else 1)end
+    local tx,ty=int(-8,W),int(-8,H)
+    local r,g,bl,al=int(0,255),int(0,255),int(0,255),int(1,255)
+    local one,two=Canvas.new(W,H),Canvas.new(W,H)
+    one:clear(9,8,7);two:clear(9,8,7)
+    one:drawTransformed(sprite,a,b,c,d,tx,ty,r,g,bl,al)
+    local v=sprite:variant(a,b,c,d,r,g,bl,al)
+    if v then two:draw(v,tx+v.ox,ty+v.oy)end
+    -- Rounding of the tint differs (pre-multiplied into the variant), +-2.
+    for i=0,W*H*4-1 do
+        if math.abs(buffer.readu8(one.frame,i)-buffer.readu8(two.frame,i))>2 then error('variant trial '..trial..' byte '..i)end
+    end
+end
 print('PASS PixelCanvas runs, mirrors, clipping, identity transforms, tints and fills match per-pixel compositing')

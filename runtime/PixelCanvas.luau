@@ -41,13 +41,26 @@ function Sprite:mirrored()
     m=Canvas.sprite(pixels,w,0,0,w,h);m.mirror=self;self.mirror=m
     return m
 end
--- Source-over blend of one source pixel (straight alpha) into the frame.
+-- Source-over blend of one source pixel (straight alpha) into the frame. A
+-- frame cleared transparent (a layer between GUI draws) keeps straight alpha.
 local function blendPixel(frame,o,sr,sg,sb,sa)
     if sa>=255 then writeu32(frame,o,bit32.bor(sr,bit32.lshift(sg,8),bit32.lshift(sb,16),0xFF000000));return end
-    local ia=255-sa
-    writeu8(frame,o,(sr*sa+readu8(frame,o)*ia+127)//255)
-    writeu8(frame,o+1,(sg*sa+readu8(frame,o+1)*ia+127)//255)
-    writeu8(frame,o+2,(sb*sa+readu8(frame,o+2)*ia+127)//255)
+    local da=readu8(frame,o+3)
+    if da==255 then
+        local ia=255-sa
+        writeu8(frame,o,(sr*sa+readu8(frame,o)*ia+127)//255)
+        writeu8(frame,o+1,(sg*sa+readu8(frame,o+1)*ia+127)//255)
+        writeu8(frame,o+2,(sb*sa+readu8(frame,o+2)*ia+127)//255)
+    elseif da==0 then writeu32(frame,o,bit32.bor(sr,bit32.lshift(sg,8),bit32.lshift(sb,16),bit32.lshift(sa,24)));return
+    else
+        -- out = s*sa + d*da*(1-sa), in 0..255 squared units.
+        local dw=da*(255-sa)
+        local oa=sa*255+dw
+        writeu8(frame,o,(sr*sa*255+readu8(frame,o)*dw+oa//2)//oa)
+        writeu8(frame,o+1,(sg*sa*255+readu8(frame,o+1)*dw+oa//2)//oa)
+        writeu8(frame,o+2,(sb*sa*255+readu8(frame,o+2)*dw+oa//2)//oa)
+        writeu8(frame,o+3,(oa+127)//255);return
+    end
     writeu8(frame,o+3,255)
 end
 Canvas.blendPixel=blendPixel
@@ -127,6 +140,54 @@ function Canvas:drawTransformed(sprite,a,b,c,d,tx,ty,r,g,bl,alpha)
         end
     end
 end
+-- A sprite under one tint and linear map (a,b,c,d), resampled once
+-- nearest-neighbour into its own buffer and cached; drawn later with :draw at
+-- (round(tx)+ox, round(ty)+oy). flat replaces colour by the tint (silhouettes).
+-- Returns nil when nothing is visible, or nil,true once the cache is full.
+function Sprite:variant(a,b,c,d,r,g,bl,alpha,flat)
+    local key=table.concat({floor(a*1024+.5),floor(b*1024+.5),floor(c*1024+.5),floor(d*1024+.5),r,g,bl,alpha,flat and 1 or 0},':')
+    local cache=self.variants;if not cache then cache={};self.variants=cache;self.variantCount=0 end
+    local v=cache[key]
+    if v~=nil then return v or nil end
+    -- ponytail: per-sprite cap; fades/spins past it should use drawTransformed.
+    if self.variantCount>=48 then return nil,true end
+    self.variantCount+=1
+    v=false
+    local det=a*d-b*c
+    if det~=0 and alpha>0 then
+        local w,h=self.w,self.h
+        local x0,x1,y0,y1=math.min(0,a*w,c*h,a*w+c*h),math.max(0,a*w,c*h,a*w+c*h),math.min(0,b*w,d*h,b*w+d*h),math.max(0,b*w,d*h,b*w+d*h)
+        local ox,oy=floor(x0+.5),floor(y0+.5)
+        local vw,vh=floor(x1+.5)-ox,floor(y1+.5)-oy
+        if vw>0 and vh>0 then
+            local out=buffer.create(vw*vh*4)
+            local ia,ib,ic,id=d/det,-b/det,-c/det,a/det
+            local source,stride,sx,sy=self.source,self.stride,self.x,self.y
+            for py=0,vh-1 do
+                local cy=py+oy+.5
+                for px=0,vw-1 do
+                    local cx=px+ox+.5
+                    local u,t=floor(ia*cx+ic*cy),floor(ib*cx+id*cy)
+                    if u>=0 and u<w and t>=0 and t<h then
+                        local o=((sy+t)*stride+sx+u)*4;local sa=readu8(source,o+3)
+                        if sa>0 then
+                            local q=(py*vw+px)*4
+                            if flat then writeu8(out,q,r);writeu8(out,q+1,g);writeu8(out,q+2,bl)
+                            else
+                                writeu8(out,q,(readu8(source,o)*r+127)//255);writeu8(out,q+1,(readu8(source,o+1)*g+127)//255)
+                                writeu8(out,q+2,(readu8(source,o+2)*bl+127)//255)
+                            end
+                            writeu8(out,q+3,(sa*alpha+127)//255)
+                        end
+                    end
+                end
+            end
+            v=Canvas.sprite(out,vw,0,0,vw,vh);v.ox,v.oy=ox,oy
+        end
+    end
+    cache[key]=v
+    return v or nil
+end
 -- Axis-aligned rectangle, source-over (opaque rows are replicated by copy).
 function Canvas:fillRect(x,y,w,h,r,g,b,a)
     local W,H,frame=self.width,self.height,self.frame
@@ -141,17 +202,23 @@ function Canvas:fillRect(x,y,w,h,r,g,b,a)
         for py=top,bottom-1 do for px=left,right-1 do blendPixel(frame,(py*W+px)*4,r,g,b,a)end end
     end
 end
--- Show the frame through one EditableImage in an ImageLabel under parent.
-function Canvas:present(parent)
+-- Upload the frame to this canvas's EditableImage; returns its Content.
+function Canvas:upload()
     if not self.image then
-        local AssetService=game:GetService('AssetService')
-        self.image=AssetService:CreateEditableImage({Size=Vector2.new(self.width,self.height)})
-        local label=Instance.new('ImageLabel');label.Name='PixelCanvas';label.BackgroundTransparency=1;label.BorderSizePixel=0
-        label.Size=UDim2.fromScale(1,1);label.ResampleMode=Enum.ResamplerMode.Pixelated
-        label.ImageContent=Content.fromObject(self.image);label.Parent=parent;self.label=label
-        self.size=Vector2.new(self.width,self.height)
+        self.image=game:GetService('AssetService'):CreateEditableImage({Size=Vector2.new(self.width,self.height)})
+        self.content=Content.fromObject(self.image);self.size=Vector2.new(self.width,self.height)
     end
     self.image:WritePixelsBuffer(Vector2.zero,self.size,self.frame)
+    return self.content
+end
+-- Show the frame through one EditableImage in an ImageLabel under parent.
+function Canvas:present(parent)
+    local content=self:upload()
+    if not self.label then
+        local label=Instance.new('ImageLabel');label.Name='PixelCanvas';label.BackgroundTransparency=1;label.BorderSizePixel=0
+        label.Size=UDim2.fromScale(1,1);label.ResampleMode=Enum.ResamplerMode.Pixelated
+        label.ImageContent=content;label.Parent=parent;self.label=label
+    end
 end
 function Canvas:destroy()
     if self.label then self.label:Destroy();self.label=nil end
