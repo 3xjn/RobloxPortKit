@@ -1,4 +1,3 @@
---!native
 --!optimize 2
 local MobileProfile = if script then require(script.Parent.MobileProfile) else nil
 local originPosition = UDim2.fromOffset(0, 0)
@@ -31,6 +30,8 @@ end
 local function park(self,entry)
     -- Hidden parented spares keep their asset loaded without UI render work.
     visible(self,entry,false)
+    -- Counted so finish() can prune cold spares past the mobile budget.
+    self.parked[entry]=true;self.parkedCount+=1
 end
 local function publish(self,entry,properties)
     -- Hidden pooled objects must receive their complete geometry and crop
@@ -296,7 +297,7 @@ function GpuScene:finish()
                 end
                 local retained=not entry.coldDetached and ((entry.region.dynamic and active) or (entry.reserve and active) or (not entry.reserve and not cropExpired(self,entry))
                     or (entry.region.dynamic and active and self.drawGeneration-entry.lastDrawn<=1))
-                visible(self,entry,false)
+                if self.keepParented and retained and entry.parented then park(self,entry)else visible(self,entry,false)end
                 if (self.keepParented and retained) or (active and not self.keepParented) then entry.lastUsed=self.drawGeneration end
                 if self.keepParented and retained and not entry.reserve then
                     entry.retainedUntil=entry.lastDrawn+self.cropRetentionFrames
@@ -335,7 +336,8 @@ function GpuScene:finish()
         for entry in self.parked do
             if self.drawGeneration-(entry.lastDrawn or 0)>=180 then
                 visible(self,entry,false)
-                if entry.parented and not self.keepParented then entry.object.Parent=nil;entry.parented=false;self.writes+=1 end
+                -- Past the budget even warm-parented spares leave the hierarchy.
+                if entry.parented then entry.object.Parent=nil;entry.parented=false;self.writes+=1 end
                 entry.coldDetached=true;entry.lastUsed=entry.lastDrawn or 0;entry.retainedUntil=nil
                 self.prunedParkedNodes+=1
                 if entry.region then entry.region.bucket.nextMaintenance=nil end

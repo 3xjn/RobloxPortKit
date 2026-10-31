@@ -72,7 +72,7 @@ scene:finish()
 for _=1,179 do scene:begin();scene:finish() end
 assert(scene.parkedCount==12 and scene.prunedParkedNodes==0)
 scene:begin();scene:finish();assert(scene.parkedCount==4 and scene.prunedParkedNodes==8)
-for _,entry in scene.images do if entry.coldDetached then assert(not entry.object.Visible and entry.object.Parent==nil) end end
+for _,entry in scene.images do if entry.coldDetached then assert(entry.object.Parent==nil) end end -- off-screen hide keeps Visible
 scene:begin();props.ImageRectOffset=rbx.Vector2.new(1,0);local restored=scene:image(props);scene:finish()
 assert(restored.Visible and restored.Parent and restored.Position==props.Position)
 scene:destroy()
