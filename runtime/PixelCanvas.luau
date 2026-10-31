@@ -145,12 +145,17 @@ end
 -- (round(tx)+ox, round(ty)+oy). flat replaces colour by the tint (silhouettes).
 -- Returns nil when nothing is visible, or nil,true once the cache is full.
 function Sprite:variant(a,b,c,d,r,g,bl,alpha,flat)
-    local key=table.concat({floor(a*1024+.5),floor(b*1024+.5),floor(c*1024+.5),floor(d*1024+.5),r,g,bl,alpha,flat and 1 or 0},':')
+    -- Numeric keys (no string per draw): tint+flat, then the 4 matrix entries
+    -- at 1/1024 (13 bits each while |entry|<4, exact in a double).
+    local tintKey=((r*256+g)*256+bl)*256+alpha+(if flat then 2^32 else 0)
+    local mapKey=(((floor(a*1024+.5)+4096)*8192+floor(b*1024+.5)+4096)*8192+floor(c*1024+.5)+4096)*8192+floor(d*1024+.5)+4096
     local cache=self.variants;if not cache then cache={};self.variants=cache;self.variantCount=0 end
-    local v=cache[key]
+    local byTint=cache[tintKey];if not byTint then byTint={};cache[tintKey]=byTint end
+    local v=byTint[mapKey]
     if v~=nil then return v or nil end
+    local key=mapKey;cache=byTint
     -- ponytail: per-sprite cap; fades/spins past it should use drawTransformed.
-    if self.variantCount>=48 then return nil,true end
+    if self.variantCount>=1024 then return nil,true end
     self.variantCount+=1
     v=false
     local det=a*d-b*c
