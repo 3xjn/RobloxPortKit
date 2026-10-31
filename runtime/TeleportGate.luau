@@ -1,3 +1,4 @@
+--!optimize 2
 -- Server-side inbound teleport gate (Mode 1 default: allow direct joins, reject unapproved third-party teleports).
 local TeleportGate = {}
 

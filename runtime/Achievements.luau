@@ -1,3 +1,4 @@
+--!optimize 2
 -- Platform-neutral monotonic achievement ledger. Games provide stable IDs and
 -- call unlock from their original achievement conditions; save backends merge it.
 local Achievements={};Achievements.__index=Achievements

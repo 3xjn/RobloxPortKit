@@ -1,3 +1,4 @@
+--!optimize 2
 local Stepper = {}
 Stepper.__index = Stepper
 

@@ -1,3 +1,4 @@
+--!optimize 2
 -- Native decoding keeps asset decompression out of the Luau frame budget.
 local Payload={}
 function Payload.decode(encoded,entry,legacy,service)

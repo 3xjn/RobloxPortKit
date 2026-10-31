@@ -1,3 +1,4 @@
+--!optimize 2
 -- Reusable event sounds. The host calls update once per frame to enforce atlas boundaries.
 local AudioPool={};AudioPool.__index=AudioPool
 local Handle={};Handle.__index=Handle

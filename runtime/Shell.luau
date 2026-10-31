@@ -1,3 +1,4 @@
+--!optimize 2
 local Shell = {}
 Shell.__index = Shell
 local bindingSerial = 0

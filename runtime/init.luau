@@ -1,3 +1,4 @@
+--!optimize 2
 local PortKit = {}
 PortKit.Preloader = require(script.Preloader)
 PortKit.Shell = require(script.Shell)

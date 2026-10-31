@@ -1,3 +1,4 @@
+--!optimize 2
 -- Server-only service. Domain validation and merge rules are supplied by each port.
 local TeleportGate = require(script.Parent.TeleportGate)
 local SaveServer = {}

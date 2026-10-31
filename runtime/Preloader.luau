@@ -1,3 +1,4 @@
+--!optimize 2
 --!nonstrict
 -- Startup asset warming and a self-contained loading screen.
 local Preloader = {}

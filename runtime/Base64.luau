@@ -1,3 +1,4 @@
+--!optimize 2
 local Base64={}
 local alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local values={};for i=1,#alphabet do values[alphabet:sub(i,i)]=i-1 end

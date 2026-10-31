@@ -1,3 +1,4 @@
+--!optimize 2
 -- Sound-shaped source for AudioPool's native Wire graph mode. Playback stays
 -- on AudioPlayer; no Sound or software audio substitute is created.
 local Source={}

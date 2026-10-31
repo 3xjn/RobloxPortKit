@@ -1,3 +1,4 @@
+--!optimize 2
 local SaveClient = {}
 SaveClient.__index = SaveClient
 function SaveClient.new(config)

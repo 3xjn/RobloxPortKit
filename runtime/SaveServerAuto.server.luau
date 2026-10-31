@@ -1,3 +1,4 @@
+--!optimize 2
 -- Optional standalone launcher: explicit adjacent config is required.
 -- Games with their own save server must never launch a second service.
 local servers = game:GetService("ServerScriptService")

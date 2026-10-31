@@ -1,4 +1,4 @@
---!native
+--!optimize 2
 local Policy = require(script.Parent.EditableImagePolicy)
 local AtlasPool = {}
 AtlasPool.__index = AtlasPool

@@ -1,3 +1,4 @@
+--!optimize 2
 -- Revisioned binary files for runtimes that expose an ordinary filesystem.
 local Base64=require(script.Parent.Base64)
 local FileStore={};FileStore.__index=FileStore

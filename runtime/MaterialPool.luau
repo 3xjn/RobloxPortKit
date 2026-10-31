@@ -1,3 +1,4 @@
+--!optimize 2
 -- Soft-alpha mesh materials require a live EditableImage. Keep only bounded,
 -- referenced pages editable; ordinary UI/opaque pages use immutable Content.
 local Policy=require(script.Parent.EditableImagePolicy)

@@ -1,3 +1,4 @@
+--!optimize 2
 -- Call only after game progress has passed the port's server validation.
 local Badges={}
 function Badges.new(mapping,service)

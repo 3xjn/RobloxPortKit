@@ -1,3 +1,4 @@
+--!optimize 2
 -- Share one policy per runtime to count every successful editable allocation.
 -- Static published assets should use Content.fromUri instead of staging pixels.
 local Policy = {}
