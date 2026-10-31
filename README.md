@@ -279,18 +279,23 @@ Given the same inputs and settings, the tick schedule is deterministic.
 ### Preloader
 
 ```luau
-local preloader = Kit.Preloader.new({ title = "My Port", accentColor = Color3.fromRGB(91, 140, 255) })
-preloader:preload({ sounds = { ... }, images = { ... } })
-preloader:setStage("Loading levels", 0.6)
+local preloader = Kit.Preloader.new({ title = "My Port" })
+preloader:checkpoint("Unpacking files...", 0.25)
+preloader:preload({ sounds = { ... }, images = { ... }, progressEnd = 0.9 })
+preloader:setStage("Starting...", 0.96)
 preloader:finish()
 ```
 
-Preloading deduplicates URIs, uses batches of 10 and returns
+Renders a pure-black full-screen curtain with an understated bottom-right HUD
+(`Loading` / `Loading <Title>`, `0%–100%`, and a 3 px monochrome bar) that fades
+out cleanly on `finish()`. Call `setTitle(title)` to set or update the title
+after reading metadata, and `checkpoint(label?, fraction?, budgetSec?)` inside
+synchronous unpack/decode loops to cooperatively yield every `25 ms` so progress
+animates smoothly. Preloading deduplicates URIs, uses batches of 10 and returns
 `{status, total, completed, failures}`. You can configure `timeoutSec` (8),
-`batchSize` and `skipAfterSec` (3; `false` hides Skip). `fail(message)` leaves
-an error visible. A timeout or skip can leave assets cold, and Roblox may evict
-hidden textures later. Inject `contentProvider`, `instanceFactory` and
-`scheduler` for headless use.
+`batchSize` and `skipAfterSec` (3; `false` hides Skip). `fail(message)` hides
+the HUD and shows a centered error. Inject `contentProvider`, `instanceFactory`,
+`runService` and `scheduler` for headless or offline tests.
 
 ### MobileProfile
 
