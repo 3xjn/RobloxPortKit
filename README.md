@@ -199,10 +199,23 @@ Bindings use KeyCode names, gamepad buttons, or `MouseButton1` / `MouseButton2`.
 L2/R2 use 0.25/0.18 hysteresis, and Gamepad2+ is ignored. Losing focus or
 opening a modal clears held inputs and toggles.
 
-**Touch.** Action specs accept `position`, `size` and `anchorPoint`;
-`touchLayout` accepts `movePosition` and `moveSize`. Mount controls inside
-`shell.HudGui`. Movement is eight-directional, and separate fingers hold and
-release actions independently, including sliding off a button and back on.
+**Touch.** Mount controls inside `shell.HudGui`. Action specs accept `position`,
+`size`, `anchorPoint`, `textSize`, `label`, `visible`, context-scoped `labels`, and
+`contexts` (an array or boolean map; omitted means all contexts). Set the initial
+`touchContext` (default `"default"`), then use `input:setTouchContext(name)` /
+`getTouchContext()`. `setActionVisible(action, boolean)` and
+`setActionLabel(action, string)` override context rules; pass `nil` to clear.
+Hiding an action releases its fingers; a fresh touch is required to activate again.
+
+`touchLayout` accepts `movePosition`, `moveSize`, and `moveMode = "Fixed"` (default)
+or `"Dynamic"` to anchor a thumbstick wherever a touch begins in its capture area.
+Use `moveContexts` to scope movement, and `moveAxes = "XY"`, `"X"`, `"Y"`, or
+`{gameplay = "X", default = "XY"}` to project movement and update arrow cues.
+`moveDeadzone` / `moveRadius` default to 14 / 38 pixels. Dynamic controls follow
+the finger beyond the radius (`dynamicFollow = false` disables this);
+`hideIdleMove = true` hides the idle pad. `moveAreaPosition` / `moveAreaSize`
+customize the default left-screen capture area. Separate fingers hold actions
+independently, including sliding off a visible button and back on.
 
 ### Pointer drag & drop
 

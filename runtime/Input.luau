@@ -21,6 +21,18 @@ local function geometry(self,object)
     return entry.position,entry.size
 end
 
+local function normalizeContexts(spec)
+	if spec == nil then return nil end
+	local contexts = {}
+	for key, value in spec do
+		if type(key) == "number" then contexts[value] = true else contexts[key] = value == true end
+	end
+	return contexts
+end
+local function writeChanged(object, property, value)
+	if object[property] ~= value then object[property] = value end
+end
+
 function Input.new(config)
 	config = config or {}
 	local deadzone = config.dragDeadzone or 4
@@ -32,7 +44,7 @@ function Input.new(config)
 			down = false, dragging = false, startX = 0, startY = 0, deltaX = 0, deltaY = 0, cancelled = false},
 		canvas = config.canvas, canvasScale = config.canvasScale, dragDeadzone = deadzone,
 		layout = config.layout or "Platformer", pointerSecondary = false,
-		touchLayout = config.touchLayout or {},
+		touchLayout = config.touchLayout or {}, touchContext = config.touchContext or "default",
 		touchMode = config.touchMode or "Auto", lastType = nil, uis = config.uis,
 		gamepadStyle = "xbox", gamepadStyleOverride = config.gamepadStyleOverride,
 		ControllerHasFocus = false, Attached = false, hapticService = config.hapticService, vibration = {}}, Input)
@@ -75,7 +87,7 @@ function Input:reset()
 	self:cancelPointer()
 	table.clear(self.sources); table.clear(self.presses); table.clear(self.toggled); table.clear(self.touch)
 	self.stick = Vector2.zero; self.moveTouch = nil; self.pointerTouch = nil
-	if self.thumb then self.thumb.Position = UDim2.fromScale(.5, .5) end
+	self:setTouchDirection(0, 0); self:resetMoveZone()
 end
 function Input:setEnabled(value) self:reset(); self.enabled = value; self:updateTouchVisibility() end
 function Input:axis(negative, positive, component)
@@ -252,26 +264,100 @@ function Input:updateTouchVisibility()
 	if not self.overlay then return end
 	local kind = self.lastType or "Touch"
 	local show = self.touchMode == "On" or (self.touchMode == "Auto" and self.uis.TouchEnabled and kind ~= "Keyboard" and not kind:match("^Gamepad") and not kind:match("^Mouse"))
-	self.overlay.Visible = self.enabled and show
+	writeChanged(self.overlay, "Visible", self.enabled and show)
 	if not self.overlay.Visible then
 		for action, sources in self.sources do
 			for source in sources do if type(source) ~= "string" or source:match("^Touch") then self:setSource(action, source, false) end end
 		end
 		if self.pointerTouch then self:cancelPointer() end
 		self.moveTouch = nil; self.pointerTouch = nil; table.clear(self.touch)
+		self:setTouchDirection(0, 0); self:resetMoveZone()
+	end
+end
+function Input:getTouchContext() return self.touchContext end
+function Input:setTouchContext(context)
+	assert(type(context) == "string" and context ~= "", "Invalid touch context")
+	if self.touchContext == context then return end
+	self.touchContext = context; self:applyTouchContext()
+end
+function Input:setActionVisible(action, visible)
+	assert(visible == nil or type(visible) == "boolean", "Invalid visibility override")
+	for _, entry in self.touchButtons or {} do
+		if entry.action == action then entry.visibleOverride = visible end
+	end
+	self:applyTouchContext()
+end
+function Input:setActionLabel(action, label)
+	assert(label == nil or type(label) == "string", "Invalid label override")
+	for _, entry in self.touchButtons or {} do
+		if entry.action == action then entry.labelOverride = label end
+	end
+	self:applyTouchContext()
+end
+function Input:resolveMoveAxes()
+	local axes = self.touchLayout.moveAxes
+	if type(axes) == "string" then return axes end
+	if type(axes) == "table" then return axes[self.touchContext] or axes.default or "XY" end
+	return "XY"
+end
+function Input:resetMoveZone()
+	self.moveOrigin = nil
+	if self.moveZone and self.touchLayout.moveMode == "Dynamic" then
+		writeChanged(self.moveZone, "Position", self.moveHomePosition)
+		writeChanged(self.moveZone, "BackgroundTransparency", .86)
+		writeChanged(self.moveZone, "Visible", self.moveVisible == true and not self.touchLayout.hideIdleMove)
+	end
+end
+function Input:applyTouchContext()
+	for _, entry in self.touchButtons or {} do
+		local visible = if entry.visibleOverride ~= nil then entry.visibleOverride else (entry.contexts == nil or entry.contexts[self.touchContext] == true)
+		local text = entry.labelOverride or (entry.labels and entry.labels[self.touchContext]) or entry.defaultLabel
+		writeChanged(entry.button, "Visible", visible)
+		writeChanged(entry.button, "Text", text)
+		if not visible then
+			for ev, action in self.touch do
+				if action == entry.action then self:setTouchAction(ev, nil) end
+			end
+		end
+	end
+	local moveVisible = self.moveContexts == nil or self.moveContexts[self.touchContext] == true
+	self.moveVisible = moveVisible
+	if self.moveArea then writeChanged(self.moveArea, "Visible", moveVisible) end
+	if self.moveZone then
+		writeChanged(self.moveZone, "Visible", moveVisible and (self.touchLayout.moveMode ~= "Dynamic" or self.moveTouch ~= nil or not self.touchLayout.hideIdleMove))
+	end
+	local axes = self:resolveMoveAxes()
+	for direction, arrow in self.moveArrows or {} do
+		local vertical = direction == "up" or direction == "down"
+		writeChanged(arrow, "Visible", if vertical then axes ~= "X" else axes ~= "Y")
+	end
+	if not moveVisible then
+		self.moveTouch = nil; self:setTouchDirection(0, 0); self:resetMoveZone()
+	else
+		self:setTouchDirection(self.lastMoveDx or 0, self.lastMoveDy or 0)
 	end
 end
 function Input:setTouchDirection(dx, dy)
-	local angle = math.atan2(dy, dx)
-	local sector = math.floor(angle / (math.pi / 4) + .5)
-	local x, y = 0, 0
-	if dx * dx + dy * dy >= 14 * 14 then x = math.round(math.cos(sector * math.pi / 4)); y = math.round(math.sin(sector * math.pi / 4)) end
-	if self.thumb then
-        local distance = math.sqrt(dx * dx + dy * dy)
-        local factor = if distance > 0 then math.min(distance, 38) / distance else 0
-        self.thumb.Position = UDim2.new(.5, dx * factor, .5, dy * factor)
-    end
-    self:setSource("left", "TouchMove", x < 0); self:setSource("right", "TouchMove", x > 0)
+	self.lastMoveDx, self.lastMoveDy = dx, dy
+	local axes = self:resolveMoveAxes()
+	local deadzone, radius = self.touchLayout.moveDeadzone or 14, self.touchLayout.moveRadius or 38
+	local x, y, tx, ty = 0, 0, 0, 0
+	if axes == "X" then
+		x = if math.abs(dx) >= deadzone then (if dx > 0 then 1 else -1) else 0
+		tx = math.clamp(dx, -radius, radius)
+	elseif axes == "Y" then
+		y = if math.abs(dy) >= deadzone then (if dy > 0 then 1 else -1) else 0
+		ty = math.clamp(dy, -radius, radius)
+	else
+		local angle = math.atan2(dy, dx)
+		local sector = math.floor(angle / (math.pi / 4) + .5)
+		if dx * dx + dy * dy >= deadzone * deadzone then x = math.round(math.cos(sector * math.pi / 4)); y = math.round(math.sin(sector * math.pi / 4)) end
+		local distance = math.sqrt(dx * dx + dy * dy)
+		local factor = if distance > 0 then math.min(distance, radius) / distance else 0
+		tx, ty = dx * factor, dy * factor
+	end
+	if self.thumb then writeChanged(self.thumb, "Position", UDim2.new(.5, tx, .5, ty)) end
+	self:setSource("left", "TouchMove", x < 0); self:setSource("right", "TouchMove", x > 0)
 	self:setSource("up", "TouchMove", y < 0); self:setSource("down", "TouchMove", y > 0)
 end
 function Input:_track(connection) table.insert(self.connections, connection) end
@@ -308,6 +394,7 @@ function Input:moveTouchAction(event)
 	if self.touch[event] == nil then return end
 	local action
 	for _, entry in self.touchButtons or {} do
+		if entry.button.Visible == false then continue end
 		local p, size = geometry(self,entry.button)
 		if event.Position.X >= p.X and event.Position.X < p.X + size.X and event.Position.Y >= p.Y and event.Position.Y < p.Y + size.Y then
 			action = entry.action; break
@@ -336,21 +423,44 @@ function Input:mountTouch(hud, layout, actions)
 			toggle.Text = if self.pointerSecondary then "Right click: on" else "Right click: off"
 		end))
 	else
-		local zone = button("Move", "", self.touchLayout.movePosition or UDim2.new(0, 18, 1, -158), self.touchLayout.moveSize or UDim2.fromOffset(140, 140))
-        zone.BackgroundTransparency = .8
-        for _, cue in {{"▲", .5, .13}, {"▼", .5, .87}, {"◀", .13, .5}, {"▶", .87, .5}} do
-            local arrow = Instance.new("TextLabel"); arrow.BackgroundTransparency = 1; arrow.Text = cue[1]
-            arrow.TextSize = 12; arrow.TextColor3 = Color3.fromRGB(216, 228, 241); arrow.TextTransparency = .3
-            arrow.Size = UDim2.fromOffset(20, 20); arrow.AnchorPoint = Vector2.new(.5, .5); arrow.Position = UDim2.fromScale(cue[2], cue[3]); arrow.ZIndex = 111; arrow.Parent = zone
-        end
+		local dynamic = self.touchLayout.moveMode == "Dynamic"
+		self.moveContexts = normalizeContexts(self.touchLayout.moveContexts)
+		local zone = button("Move", "", self.touchLayout.movePosition or (if dynamic then UDim2.new(0, 88, 1, -88) else UDim2.new(0, 18, 1, -158)), self.touchLayout.moveSize or UDim2.fromOffset(if dynamic then 128 else 140, if dynamic then 128 else 140))
+		zone.BackgroundTransparency = if dynamic then .86 else .8
+		if dynamic then zone.AnchorPoint = Vector2.new(.5, .5); zone.Active = false end
+		self.moveHomePosition = zone.Position
+		local capture = zone
+		if dynamic then
+			local moveArea = Instance.new("TextButton"); moveArea.Name = "MoveArea"; moveArea.Text = ""
+			moveArea.BackgroundTransparency = 1; moveArea.BorderSizePixel = 0
+			moveArea.Position = self.touchLayout.moveAreaPosition or UDim2.new(0, 0, .16, 0)
+			moveArea.Size = self.touchLayout.moveAreaSize or UDim2.new(.48, 0, .84, 0)
+			moveArea.ZIndex = 109; moveArea.Selectable = false; moveArea.Parent = overlay
+			self.moveArea = moveArea; capture = moveArea
+		end
+		self.moveArrows = {}
+		for _, cue in {{"▲", .5, .13, "up"}, {"▼", .5, .87, "down"}, {"◀", .13, .5, "left"}, {"▶", .87, .5, "right"}} do
+			local arrow = Instance.new("TextLabel"); arrow.BackgroundTransparency = 1; arrow.Text = cue[1]
+			arrow.TextSize = 12; arrow.TextColor3 = Color3.fromRGB(216, 228, 241); arrow.TextTransparency = .3
+			arrow.Size = UDim2.fromOffset(20, 20); arrow.AnchorPoint = Vector2.new(.5, .5); arrow.Position = UDim2.fromScale(cue[2], cue[3]); arrow.ZIndex = 111; arrow.Parent = zone
+			self.moveArrows[cue[4]] = arrow
+		end
         local thumb = Instance.new("Frame"); thumb.Size = UDim2.fromOffset(42, 42); thumb.AnchorPoint = Vector2.new(.5, .5); thumb.Position = UDim2.fromScale(.5, .5)
         thumb.BackgroundColor3 = Color3.fromRGB(202, 224, 239); thumb.BackgroundTransparency = .5; thumb.BorderSizePixel = 0; thumb.ZIndex = 112; thumb.Parent = zone
         local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = thumb; self.thumb = thumb
-		self:_track(zone.InputBegan:Connect(function(event)
-			if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and not self.moveTouch then
+		self:_track(capture.InputBegan:Connect(function(event)
+			if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and capture.Visible ~= false and not self.moveTouch then
 				self.moveTouch = event
-				local position,size=geometry(self,zone);local center=position+size/2
-				self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
+				if dynamic then
+					self.moveOrigin = Vector2.new(event.Position.X, event.Position.Y)
+					local overlayPos = geometry(self, overlay)
+					writeChanged(zone, "Position", UDim2.fromOffset(self.moveOrigin.X - overlayPos.X, self.moveOrigin.Y - overlayPos.Y))
+					writeChanged(zone, "BackgroundTransparency", .72); writeChanged(zone, "Visible", true)
+					self:setTouchDirection(0, 0)
+				else
+					local position, size = geometry(self, zone); local center = position + size / 2
+					self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
+				end
 			end
 		end))
 		self.moveZone = zone
@@ -360,23 +470,53 @@ function Input:mountTouch(hud, layout, actions)
             local pos = positions[i] or {-18 - (i - 1) * 68, -20, 54}
             local b = button(spec.action, spec.label or spec.action, spec.position or UDim2.new(1, pos[1], 1, pos[2]), spec.size or UDim2.fromOffset(pos[3], pos[3]))
             b.AnchorPoint = spec.anchorPoint or Vector2.new(1, 1)
-			table.insert(self.touchButtons, {button = b, action = spec.action})
+			b.TextSize = spec.textSize or 12
+			table.insert(self.touchButtons, {button = b, action = spec.action, defaultLabel = spec.label or spec.action,
+				labels = spec.labels, contexts = normalizeContexts(spec.contexts), visibleOverride = spec.visible, labelOverride = nil})
 
 			self:_track(b.InputBegan:Connect(function(event)
-				if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible then
+				if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and b.Visible ~= false then
 					self:setTouchAction(event, spec.action)
 				end
 			end))
 		end
 	end
 	self:_track(self.uis.TouchMoved:Connect(function(event)
-		if event == self.moveTouch then local position,size=geometry(self,self.moveZone);local center=position+size/2;self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
+		if event == self.moveTouch then
+			if self.touchLayout.moveMode == "Dynamic" then
+				local ox, oy = self.moveOrigin.X, self.moveOrigin.Y
+				local dx, dy = event.Position.X - ox, event.Position.Y - oy
+				if self.touchLayout.dynamicFollow ~= false then
+					local radius, axes = self.touchLayout.moveRadius or 38, self:resolveMoveAxes()
+					if axes == "X" then
+						if math.abs(dx) > radius then ox = event.Position.X - (if dx > 0 then radius else -radius) end
+						oy = event.Position.Y
+					elseif axes == "Y" then
+						if math.abs(dy) > radius then oy = event.Position.Y - (if dy > 0 then radius else -radius) end
+						ox = event.Position.X
+					else
+						local dist = math.sqrt(dx * dx + dy * dy)
+						if dist > radius then local scale = radius / dist; ox = event.Position.X - dx * scale; oy = event.Position.Y - dy * scale end
+					end
+					if ox ~= self.moveOrigin.X or oy ~= self.moveOrigin.Y then
+						self.moveOrigin = Vector2.new(ox, oy)
+						local overlayPos = geometry(self, self.overlay)
+						writeChanged(self.moveZone, "Position", UDim2.fromOffset(ox - overlayPos.X, oy - overlayPos.Y))
+					end
+					dx, dy = event.Position.X - ox, event.Position.Y - oy
+				end
+				self:setTouchDirection(dx, dy)
+			else
+				local position, size = geometry(self, self.moveZone); local center = position + size / 2
+				self:setTouchDirection(event.Position.X - center.X, event.Position.Y - center.Y)
+			end
 		elseif self.touch[event] ~= nil then self:moveTouchAction(event) end
 	end))
 	self:_track(self.uis.TouchEnded:Connect(function(event)
-		if event == self.moveTouch then self.moveTouch = nil; self:setTouchDirection(0, 0) end
+		if event == self.moveTouch then self.moveTouch = nil; self:setTouchDirection(0, 0); self:resetMoveZone() end
 		if self.touch[event] ~= nil then self:setTouchAction(event, nil) end
 	end))
+	self:applyTouchContext()
 	self:updateTouchVisibility()
 end
 function Input:destroy()

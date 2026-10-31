@@ -1,3 +1,4 @@
+--!optimize 2
 local fs = require("@lune/fs")
 local roblox = require("@lune/roblox")
 local total = 0
@@ -207,6 +208,165 @@ test("touch chords and sliding retain independent fingers", function()
 	jump.Position.X = 5; i:moveTouchAction(jump); assert(i:check("jump"))
 	i:setTouchAction(jump, nil); i:setTouchAction(grab, nil); assert(not i:check("jump") and not i:check("grab"))
 end)
+-- Deterministic event/GUI fixture: counts every native property assignment.
+local function touchFixture(config, actions)
+	local function signal()
+		local callbacks = {}
+		return {Connect = function(_, fn)
+			local connection = {connected = true}
+			function connection:Disconnect() self.connected = false end
+			table.insert(callbacks, {fn, connection}); return connection
+		end, Fire = function(_, ...)
+			for _, item in callbacks do if item[2].connected then item[1](...) end end
+		end}
+	end
+	local writes, created = 0, {}
+	local previousInstance, previousFont = globals.Instance, globals.Enum.Font
+	globals.Enum.Font = {GothamMedium = "GothamMedium"}
+	globals.Instance = {new = function(class)
+		local values = {Visible = true, AbsolutePosition = roblox.Vector2.new(10, 20),
+			AbsoluteSize = roblox.Vector2.new(100, 100), InputBegan = signal(), Activated = signal(),
+			Destroy = function(self) self.destroyed = true end}
+		local object = setmetatable({}, {__index = values, __newindex = function(_, key, value)
+			values[key] = value; writes += 1
+		end})
+		table.insert(created, object); return object
+	end}
+	local uis = {TouchEnabled = true, TouchMoved = signal(), TouchEnded = signal()}
+	config = config or {}; config.connect = false; config.uis = uis
+	local i = Input.new(config)
+	local ok, message = pcall(function() i:mountTouch({}, "Platformer", actions or {}) end)
+	globals.Instance, globals.Enum.Font = previousInstance, previousFont
+	assert(ok, message)
+	local function touch(x, y)
+		return {UserInputType = globals.Enum.UserInputType.Touch, Position = {X = x, Y = y}}
+	end
+	return i, uis, touch, function() return writes, #created end
+end
+
+test("touch contexts diff writes, override labels and end hidden finger ownership", function()
+	local i, uis, touch, counts = touchFixture({touchContext = "gameplay"}, {
+		{action = "jump", label = "Jump", contexts = {"gameplay"}, labels = {gameplay = "Hop"}, textSize = 18},
+		{action = "menu", contexts = {menu = true}}, {action = "always"},
+		{action = "disabled", visible = false}})
+	local jump, menu = i.touchButtons[1].button, i.touchButtons[2].button
+	assert(i:getTouchContext() == "gameplay" and jump.Visible and jump.Text == "Hop" and jump.TextSize == 18)
+	assert(not menu.Visible and i.touchButtons[3].button.Visible and not i.touchButtons[4].button.Visible)
+	local held, other = touch(15, 25), touch(15, 25)
+	jump.InputBegan:Fire(held); i:setTouchAction(other, "jump"); assert(i:check("jump"))
+	i:setTouchContext("menu")
+	assert(not jump.Visible and menu.Visible and jump.Text == "Jump")
+	assert(not i:check("jump") and i.touch[held] == nil and i.touch[other] == nil)
+	uis.TouchMoved:Fire(held); assert(not i:check("menu"), "Cancelled finger must not acquire overlapping menu")
+	jump.InputBegan:Fire(held); assert(i.touch[held] == nil, "Hidden button must reject begins")
+	local before, objects = counts()
+	i:setTouchContext("menu"); i:applyTouchContext(); i:updateTouchVisibility()
+	local after, retained = counts(); assert(before == after and objects == retained)
+	menu.InputBegan:Fire(held); assert(i:check("menu")); uis.TouchEnded:Fire(held); assert(i.touch[held] == nil)
+	i:setActionVisible("jump", true); assert(jump.Visible)
+	i:setActionLabel("jump", "Fly"); assert(jump.Text == "Fly")
+	i:setActionLabel("jump", nil); assert(jump.Text == "Jump")
+	i:setActionVisible("jump", nil); assert(not jump.Visible)
+	i:setTouchContext("gameplay"); assert(jump.Visible and jump.Text == "Hop")
+	i:setActionVisible("jump", false); assert(not jump.Visible)
+	i:setActionVisible("jump", nil); assert(jump.Visible)
+	for _, bad in {false, "", 42} do assert(not pcall(i.setTouchContext, i, bad)) end
+	assert(not pcall(i.setActionVisible, i, "jump", 1))
+	assert(not pcall(i.setActionLabel, i, "jump", false))
+end)
+
+test("sliding skips hidden overlapping action buttons", function()
+	local i, _, touch = touchFixture(nil, {{action = "hidden", visible = false}, {action = "shown"}})
+	local finger = touch(15, 25)
+	i:setTouchAction(finger, false); i:moveTouchAction(finger)
+	assert(i:check("shown") and not i:check("hidden"))
+	i:setActionVisible("shown", false)
+	assert(i.touch[finger] == nil and not i:check("shown"))
+end)
+
+test("context axes project held drags, cues and thumb with diff writes", function()
+	local i, _, _, counts = touchFixture({touchLayout = {moveAxes = {gameplay = "X", vertical = "Y", default = "XY"}}})
+	i:setTouchDirection(60, -60); assert(i:check("right") and i:check("up"))
+	i:setTouchContext("gameplay")
+	assert(i:check("right") and not i:check("up") and not i:check("down") and not i:check("left"))
+	assert(not i.moveArrows.up.Visible and not i.moveArrows.down.Visible and i.moveArrows.left.Visible and i.moveArrows.right.Visible)
+	assert(i.thumb.Position == roblox.UDim2.new(.5, 38, .5, 0))
+	local before = counts(); i:setTouchDirection(60, -60); assert(counts() == before)
+	i:setTouchContext("vertical")
+	assert(i:check("up") and not i:check("right") and not i:check("left"))
+	assert(i.moveArrows.up.Visible and not i.moveArrows.right.Visible)
+	assert(i.thumb.Position == roblox.UDim2.new(.5, 0, .5, -38))
+	i:setTouchContext("other"); assert(i:check("right") and i:check("up") and i.moveArrows.right.Visible)
+	i.touchLayout.moveAxes = "X"; i.touchLayout.moveDeadzone = 20; i.touchLayout.moveRadius = 30
+	i:setTouchDirection(19, 90); assert(not i:check("right") and not i:check("down"))
+	i:setTouchDirection(-20, 90); assert(i:check("left") and i.thumb.Position == roblox.UDim2.new(.5, -20, .5, 0))
+end)
+
+test("dynamic pad anchors, follows each axis and stops promptly on reversal", function()
+	for _, axes in {"X", "Y", "XY"} do
+		local i, uis, touch, counts = touchFixture({touchContext = "gameplay", touchLayout = {
+			moveMode = "Dynamic", moveContexts = {"gameplay"}, moveAxes = axes, hideIdleMove = true}})
+		assert(not i.moveZone.Visible and i.moveArea.Visible)
+		local finger = touch(145, 275)
+		i.moveArea.InputBegan:Fire(finger)
+		assert(i.moveTouch == finger and i.moveOrigin == roblox.Vector2.new(145, 275))
+		assert(i.moveZone.Position == roblox.UDim2.fromOffset(135, 255) and i.moveZone.Visible and i.moveZone.BackgroundTransparency == .72)
+		local second = touch(20, 100); i.moveArea.InputBegan:Fire(second); assert(i.moveTouch == finger)
+		local vertical = axes == "Y"
+		finger.Position = if vertical then {X = 160, Y = 575} else {X = 445, Y = 275}
+		uis.TouchMoved:Fire(finger)
+		local offset = roblox.Vector2.new(finger.Position.X, finger.Position.Y) - i.moveOrigin
+		assert(math.abs(offset.Magnitude - 38) < .0001)
+		assert(i:check(if vertical then "down" else "right"))
+		-- Reverse 38 - 14 + 2 pixels: inside the deadzone at the leashed origin.
+		if vertical then finger.Position.Y -= 26 else finger.Position.X -= 26 end
+		uis.TouchMoved:Fire(finger); assert(not i:check("right") and not i:check("down"))
+		if vertical then finger.Position.Y -= 28 else finger.Position.X -= 28 end
+		uis.TouchMoved:Fire(finger); assert(i:check(if vertical then "up" else "left"))
+		local before = counts(); uis.TouchMoved:Fire(finger); assert(counts() == before)
+		i:setTouchContext("menu")
+		assert(not i.moveArea.Visible and not i.moveZone.Visible and not i.moveTouch and not i.moveOrigin)
+		assert(not i:check("left") and not i:check("up") and i.moveZone.Position == i.moveHomePosition)
+		uis.TouchMoved:Fire(finger); i.moveArea.InputBegan:Fire(second); assert(not i.moveTouch)
+		i:setTouchContext("gameplay"); assert(i.moveArea.Visible and not i.moveZone.Visible)
+		i.moveArea.InputBegan:Fire(second); uis.TouchEnded:Fire(second)
+		assert(not i.moveTouch and not i.moveOrigin and not i.moveZone.Visible and i.moveZone.BackgroundTransparency == .86)
+		i.moveArea.InputBegan:Fire(second); i:reset(); assert(not i.moveTouch and not i.moveOrigin and not i.moveZone.Visible)
+		i.moveArea.InputBegan:Fire(second); i:setTouchMode("Off")
+		assert(not i.overlay.Visible and not i.moveTouch and not i.moveOrigin)
+	end
+end)
+
+test("dynamic radial follow and disabled follow preserve configured geometry", function()
+	for _, follow in {true, false} do
+		local i, uis, touch = touchFixture({touchLayout = {moveMode = "Dynamic", dynamicFollow = follow,
+			moveRadius = 50, moveDeadzone = 10, movePosition = roblox.UDim2.fromOffset(80, 90),
+			moveSize = roblox.UDim2.fromOffset(120, 120), moveAreaPosition = roblox.UDim2.fromOffset(5, 6),
+			moveAreaSize = roblox.UDim2.fromOffset(200, 300)}})
+		assert(i.moveZone.Visible and i.moveZone.Size == roblox.UDim2.fromOffset(120, 120))
+		assert(i.moveArea.Position == roblox.UDim2.fromOffset(5, 6) and i.moveArea.Size == roblox.UDim2.fromOffset(200, 300))
+		local finger = touch(100, 200); i.moveArea.InputBegan:Fire(finger)
+		finger.Position = {X = 400, Y = 600}; uis.TouchMoved:Fire(finger)
+		assert(i.moveOrigin == (if follow then roblox.Vector2.new(370, 560) else roblox.Vector2.new(100, 200)))
+		assert(i:check("right") and i:check("down"))
+		assert(i.thumb.Position == roblox.UDim2.new(.5, 30, .5, 40))
+		uis.TouchEnded:Fire(finger); assert(i.moveZone.Visible and i.moveZone.Position == roblox.UDim2.fromOffset(80, 90))
+	end
+end)
+
+test("fixed movement keeps existing center geometry and eight-way defaults", function()
+	local i, uis, touch = touchFixture()
+	assert(i.moveZone.Position == roblox.UDim2.new(0, 18, 1, -158) and not i.moveArea)
+	local finger = touch(100, 110); i.moveZone.InputBegan:Fire(finger)
+	assert(i:check("right") and i:check("down"))
+	finger.Position = {X = 60, Y = 20}; uis.TouchMoved:Fire(finger)
+	assert(i:check("up") and not i:check("right"))
+	uis.TouchEnded:Fire(finger); assert(not i:check("up") and not i.moveTouch)
+	i.moveContexts = {menu = true}; i:applyTouchContext(); assert(not i.moveZone.Visible)
+	i.moveZone.InputBegan:Fire(finger); assert(not i.moveTouch)
+	i:setTouchContext("menu"); assert(i.moveZone.Visible)
+end)
+
 test("buffer is time limited and consumed once", function()
 	local i = input(); time = 10; i:setSource("jump", "test", true); i:setSource("jump", "test", false)
 	time = 10.1; assert(i:consumeBuffer("jump", .15)); assert(not i:consumeBuffer("jump", .15))
