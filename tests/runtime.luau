@@ -400,6 +400,62 @@ test("Platformer pointer contexts map virtual taps, drags, outside prompts and c
 	i.touchLayout.allowOutsidePointer = false; assert(not i:allowsOutsidePointer())
 end)
 
+test("touch-only visibility ignores software keyboard and emulated mouse", function()
+	for _, device in {{enabled = false}, {enabled = true}, {}} do
+		local i, uis = touchFixture()
+		uis.KeyboardEnabled = device.enabled; uis.MouseEnabled = device.enabled
+		for _, kind in {"Keyboard", "MouseMovement", "MouseButton1", "Gamepad1", "Touch"} do
+			i.lastType = kind; i:updateTouchVisibility()
+			local expected = kind == "Touch" or (device.enabled == false and kind ~= "Gamepad1")
+			assert(i.overlay.Visible == expected, "Unexpected visibility for " .. kind .. " / " .. tostring(device.enabled))
+		end
+	end
+end)
+
+test("first touch wakes canvas and controls before last-input-type notification", function()
+	for _, device in {{enabled = false, lastType = "Gamepad1"}, {enabled = true, lastType = "Keyboard"}} do
+		for _, target in {"canvas", "fixed", "moveArea", "dpad", "jump", "pause", "back"} do
+			local mode = if target == "moveArea" then "Dynamic" elseif target == "dpad" then "Dpad" else "Fixed"
+			local i, uis, touch = touchFixture({touchContext = "menu",
+				canvas = {AbsolutePosition = roblox.Vector2.new(10, 20), AbsoluteSize = roblox.Vector2.new(100, 100)},
+				touchLayout = {moveMode = mode, pointerContexts = {"menu"}}},
+				{{action = "jump", label = "Jump"}, {action = "pause", label = "II"}, {action = "back", label = "Back"}})
+			uis.KeyboardEnabled = device.enabled; uis.MouseEnabled = device.enabled
+			local function hide()
+				i.lastType = device.lastType; i:updateTouchVisibility(); assert(not i.overlay.Visible)
+			end
+			local function begin(finger)
+				if target == "canvas" then i:process("Began", finger)
+				elseif target == "fixed" then i.moveZone.InputBegan:Fire(finger)
+				elseif target == "moveArea" then i.moveArea.InputBegan:Fire(finger)
+				elseif target == "dpad" then i.dpadButtons.up.InputBegan:Fire(finger)
+				else
+					for _, entry in i.touchButtons do
+						if entry.action == target then entry.button.InputBegan:Fire(finger) end
+					end
+				end
+			end
+			hide()
+			local finger = touch(60, 70)
+			if target == "canvas" then finger.UserInputType = {Name = "Touch"} end
+			-- Invoke each path directly: no LastInputTypeChanged or service begin runs first.
+			begin(finger)
+			assert(i.lastType == "Touch" and i.overlay.Visible, "First touch did not wake " .. target)
+			if target == "canvas" then
+				assert(i.pointerTouch == finger and i.pointer.down and i:check("primary"))
+				i:process("Ended", finger); assert(i:consumeDrop().inside)
+			elseif target == "fixed" or target == "moveArea" then assert(i.moveTouch == finger)
+			elseif target == "dpad" then assert(i.dpadTouches[finger] == "up" and i:check("up"))
+			else assert(i.touch[finger] == target and i:check(target)) end
+			-- Disabled input and explicit Off must never wake the overlay.
+			i:setEnabled(false); hide(); begin(finger)
+			assert(i.lastType == device.lastType and not i.overlay.Visible)
+			i:setEnabled(true); i:setTouchMode("Off"); hide(); begin(finger)
+			assert(i.lastType == device.lastType and not i.overlay.Visible)
+		end
+	end
+end)
+
 test("Cardinal movement chooses one dominant axis and horizontal ties", function()
 	local unmounted = Input.new({connect = false, touchLayout = {moveAxes = {gameplay = "X"}}})
 	unmounted:setTouchDirection(60, -60); unmounted:setTouchContext("gameplay")
@@ -453,6 +509,28 @@ test("context movement modes retain controls and release hidden Dpad fingers", f
 	assert(not i:check("up") and next(i.dpadTouches) == nil)
 	i.dpadButtons.up.InputBegan:Fire(up); i:setTouchMode("Off")
 	assert(not i:check("up") and next(i.dpadTouches) == nil)
+end)
+
+test("SmokedGlass touch controls illuminate held buttons, D-pad cross arms, and pause bars", function()
+	local i, uis, touch, counts = touchFixture({touchContext = "gameplay", touchLayout = {
+		moveModes = {gameplay = "Fixed", menu = "Dpad"}, moveContexts = {"gameplay", "menu"},
+		moveAxes = {gameplay = "X", menu = "XY"}, moveArrows = {gameplay = "X", menu = "XY"}, freeThumb = true}}, {
+		{action = "jump", label = "Jump", size = roblox.UDim2.fromOffset(92, 92)},
+		{action = "pause", label = "II", labels = {ending = "Skip"}, size = roblox.UDim2.fromOffset(44, 44)}})
+	assert(i.touchTheme == "SmokedGlass" and i.dpadArms and i.touchButtons[1].button.AutoButtonColor == false)
+	assert(i.touchButtons[1].button.TextSize == 16 and i.touchButtons[2].pauseIcon.Visible and i.touchButtons[2].button.TextTransparency == 1)
+	i:setTouchDirection(30, 50)
+	assert(i.thumb.Position.X.Offset > 0 and i.thumb.Position.Y.Offset > 0 and i:check("right") and not i:check("down"))
+	local jf = touch(15, 25); i.touchButtons[1].button.InputBegan:Fire(jf)
+	assert(i.touchButtons[1].button.BackgroundTransparency == .12); uis.TouchEnded:Fire(jf)
+	assert(i.touchButtons[1].button.BackgroundTransparency == .28)
+	i:setTouchContext("menu")
+	local df = touch(15, 25); i.dpadButtons.up.InputBegan:Fire(df)
+	assert(i.dpadArms.up.cap.BackgroundTransparency == .10); uis.TouchEnded:Fire(df)
+	assert(i.dpadArms.up.cap.BackgroundTransparency == .28)
+	i:setTouchContext("ending")
+	assert(not i.touchButtons[2].pauseIcon.Visible and i.touchButtons[2].button.TextTransparency == 0)
+	local before = counts(); i:applyTouchContext(); assert(counts() == before)
 end)
 
 test("Dpad base mode, context hide and pointer event order cancel ownership", function()

@@ -32,6 +32,12 @@ end
 local function writeChanged(object, property, value)
 	if object[property] ~= value then object[property] = value end
 end
+local function wakeTouch(self)
+	if self.lastType ~= "Touch" then
+		self.lastType = "Touch"
+		self:updateTouchVisibility()
+	end
+end
 
 function Input.new(config)
 	config = config or {}
@@ -91,6 +97,7 @@ function Input:reset()
 	if self.dpadTouches then table.clear(self.dpadTouches) end
 	table.clear(self.sources); table.clear(self.presses); table.clear(self.toggled); table.clear(self.touch)
 	self.stick = Vector2.zero; self.moveTouch = nil; self.pointerTouch = nil
+	self:refreshActionVisuals(); self:refreshDpadVisuals()
 	self:setTouchDirection(0, 0); self:resetMoveZone()
 end
 function Input:setEnabled(value) self:reset(); self.enabled = value; self:updateTouchVisibility() end
@@ -157,6 +164,7 @@ end
 function Input:process(phase, event, processed)
 	local kind = event.UserInputType.Name
 	if kind == "Touch" then
+		if phase == "Began" and self.enabled and self.touchMode ~= "Off" then wakeTouch(self) end
 		if self:isTouchPointerEnabled() and event ~= self.moveTouch and self.touch[event] == nil
 			and (not self.dpadTouches or self.dpadTouches[event] == nil) then
 			self:processTouchPointer(phase, event, processed)
@@ -289,7 +297,12 @@ end
 function Input:updateTouchVisibility()
 	if not self.overlay then return end
 	local kind = self.lastType or "Touch"
-	local show = self.touchMode == "On" or (self.touchMode == "Auto" and self.uis.TouchEnabled and kind ~= "Keyboard" and not kind:match("^Gamepad") and not kind:match("^Mouse"))
+	local ignoreKeyboard = self.uis.KeyboardEnabled == false
+	local ignoreMouse = self.uis.MouseEnabled == false
+	local show = self.touchMode == "On" or (self.touchMode == "Auto" and self.uis.TouchEnabled
+		and (ignoreKeyboard or kind ~= "Keyboard")
+		and not kind:match("^Gamepad")
+		and (ignoreMouse or not kind:match("^Mouse")))
 	writeChanged(self.overlay, "Visible", self.enabled and show)
 	if not self.overlay.Visible then
 		for action, sources in self.sources do
@@ -298,6 +311,7 @@ function Input:updateTouchVisibility()
 		if self.pointerTouch then self:cancelPointer() end
 		self.moveTouch = nil; self.pointerTouch = nil; table.clear(self.touch)
 		if self.dpadTouches then table.clear(self.dpadTouches) end
+		self:refreshActionVisuals(); self:refreshDpadVisuals()
 		self:setTouchDirection(0, 0); self:resetMoveZone()
 	end
 end
@@ -327,10 +341,70 @@ function Input:resolveMoveAxes()
 	if type(axes) == "table" then return axes[self.touchContext] or axes.default or "XY" end
 	return "XY"
 end
+function Input:resolveMoveArrows()
+	local arrows = self.touchLayout.moveArrows
+	if type(arrows) == "string" then return arrows end
+	if type(arrows) == "table" then return arrows[self.touchContext] or arrows.default or self:resolveMoveAxes() end
+	return self:resolveMoveAxes()
+end
+function Input:resolveFreeThumb()
+	local free = self.touchLayout.freeThumb
+	if type(free) == "boolean" then return free end
+	if type(free) == "table" then return free[self.touchContext] == true or (free[self.touchContext] == nil and free.default == true) end
+	return false
+end
 function Input:resolveMoveMode()
 	local modes = self.touchLayout.moveModes
 	if type(modes) == "table" then return modes[self.touchContext] or modes.default or self.touchLayout.moveMode or "Fixed" end
 	return self.touchLayout.moveMode or "Fixed"
+end
+function Input:refreshDpadVisuals()
+	if not self.dpadArms or not self.theme then return end
+	local t = self.theme
+	local held = {}
+	for _, dir in self.dpadTouches or {} do if dir then held[dir] = true end end
+	for dir, arm in self.dpadArms do
+		local active = held[dir] == true
+		writeChanged(arm.cap, "BackgroundColor3", if active then t.glassActive else t.glassIdle)
+		writeChanged(arm.cap, "BackgroundTransparency", if active then .10 else .28)
+		writeChanged(arm.stroke, "Transparency", if active then .28 else .82)
+		for _, bar in arm.bars do writeChanged(bar, "BackgroundTransparency", if active then .02 else .32) end
+	end
+end
+function Input:refreshActionVisuals()
+	if not self.touchButtons or not self.theme then return end
+	local t = self.theme
+	local held = {}
+	for _, act in self.touch or {} do if act then held[act] = true end end
+	for _, entry in self.touchButtons do
+		local active = held[entry.action] == true
+		writeChanged(entry.button, "BackgroundColor3", if active then t.glassActive else t.glassIdle)
+		writeChanged(entry.button, "BackgroundTransparency", if active then .12 else .28)
+		if entry.stroke then writeChanged(entry.stroke, "Transparency", if active then .26 else .82) end
+		if entry.cap then writeChanged(entry.cap, "BackgroundTransparency", if active then .86 else .96) end
+	end
+end
+function Input:refreshMoveVisuals(x, y)
+	if not self.theme then return end
+	local t = self.theme
+	local grabbing = self.moveTouch ~= nil
+	if self.moveZone and self:resolveMoveMode() ~= "Dynamic" then
+		writeChanged(self.moveZone, "BackgroundColor3", t.glassIdle)
+		writeChanged(self.moveZone, "BackgroundTransparency", if grabbing then .48 else .56)
+	end
+	if self.moveStroke then writeChanged(self.moveStroke, "Transparency", if grabbing then .74 else .86) end
+	if self.thumb then
+		writeChanged(self.thumb, "BackgroundColor3", if grabbing then t.thumbActive else t.thumbIdle)
+		writeChanged(self.thumb, "BackgroundTransparency", if grabbing then .18 else .32)
+	end
+	if self.thumbStroke then writeChanged(self.thumbStroke, "Transparency", if grabbing then .50 else .74) end
+	if self.moveArrowBars then
+		local dirs = {left = (x or 0) < 0, right = (x or 0) > 0, up = (y or 0) < 0, down = (y or 0) > 0}
+		for dir, bars in self.moveArrowBars do
+			local tr = if dirs[dir] then .32 else .68
+			for _, bar in bars do writeChanged(bar, "BackgroundTransparency", tr) end
+		end
+	end
 end
 function Input:setDpadTouch(event, direction)
 	local previous = self.dpadTouches[event]
@@ -338,6 +412,7 @@ function Input:setDpadTouch(event, direction)
 	if previous then self:setSource(previous, event, false) end
 	self.dpadTouches[event] = direction
 	if direction then self:claimControlTouch(event); self:setSource(direction, event, true) end
+	self:refreshDpadVisuals()
 end
 function Input:moveDpadTouch(event)
 	for direction, button in self.dpadButtons do
@@ -372,6 +447,11 @@ function Input:applyTouchContext()
 		local text = entry.labelOverride or (entry.labels and entry.labels[self.touchContext]) or entry.defaultLabel
 		writeChanged(entry.button, "Visible", visible)
 		writeChanged(entry.button, "Text", text)
+		if entry.pauseIcon then
+			local isPauseGlyph = text == "II" or text == "?"
+			writeChanged(entry.pauseIcon, "Visible", isPauseGlyph)
+			writeChanged(entry.button, "TextTransparency", if isPauseGlyph then 1 else 0)
+		end
 		if not visible then
 			for ev, action in self.touch do
 				if action == entry.action then self:setTouchAction(ev, nil) end
@@ -392,7 +472,7 @@ function Input:applyTouchContext()
 			writeChanged(self.moveZone, "Size", self.touchLayout.moveSize or UDim2.fromOffset(if dynamic then 128 else 140, if dynamic then 128 else 140))
 			writeChanged(self.moveZone, "AnchorPoint", if dynamic then Vector2.new(.5, .5) else Vector2.zero)
 			writeChanged(self.moveZone, "Active", not dynamic)
-			writeChanged(self.moveZone, "BackgroundTransparency", if dynamic then .86 else .8)
+			writeChanged(self.moveZone, "BackgroundTransparency", if dynamic then .86 else .56)
 		end
 	end
 	if self.moveArea then writeChanged(self.moveArea, "Visible", moveVisible and mode == "Dynamic") end
@@ -404,16 +484,24 @@ function Input:applyTouchContext()
 		local vertical = direction == "up" or direction == "down"
 		local visible = moveVisible and mode == "Dpad" and (if vertical then axes ~= "X" else axes ~= "Y")
 		writeChanged(button, "Visible", visible)
+		if self.dpadArms and self.dpadArms[direction] then writeChanged(self.dpadArms[direction].clip, "Visible", visible) end
 		if not visible then
 			for event, held in self.dpadTouches do if held == direction then self:setDpadTouch(event, nil) end end
 		end
 	end
+	if self.dpadHubEdges then
+		local showH = moveVisible and mode == "Dpad" and axes == "X"
+		local showV = moveVisible and mode == "Dpad" and axes == "Y"
+		writeChanged(self.dpadHubEdges.top, "Visible", showH); writeChanged(self.dpadHubEdges.bottom, "Visible", showH)
+		writeChanged(self.dpadHubEdges.left, "Visible", showV); writeChanged(self.dpadHubEdges.right, "Visible", showV)
+	end
 	if changedMode or not moveVisible or mode ~= "Dpad" then
 		for event in self.dpadTouches or {} do self:setDpadTouch(event, nil) end
 	end
+	local arrowAxes = self:resolveMoveArrows()
 	for direction, arrow in self.moveArrows or {} do
 		local vertical = direction == "up" or direction == "down"
-		writeChanged(arrow, "Visible", if vertical then axes ~= "X" else axes ~= "Y")
+		writeChanged(arrow, "Visible", if vertical then arrowAxes ~= "X" else arrowAxes ~= "Y")
 	end
 	if not moveVisible or mode == "Dpad" then
 		self.moveTouch = nil; self:setTouchDirection(0, 0); self:resetMoveZone()
@@ -445,9 +533,15 @@ function Input:setTouchDirection(dx, dy)
 		local factor = if distance > 0 then math.min(distance, radius) / distance else 0
 		tx, ty = dx * factor, dy * factor
 	end
+	if self:resolveFreeThumb() then
+		local distance = math.sqrt(dx * dx + dy * dy)
+		local factor = if distance > 0 then math.min(distance, radius) / distance else 0
+		tx, ty = dx * factor, dy * factor
+	end
 	if self.thumb then writeChanged(self.thumb, "Position", UDim2.new(.5, tx, .5, ty)) end
 	self:setSource("left", "TouchMove", x < 0); self:setSource("right", "TouchMove", x > 0)
 	self:setSource("up", "TouchMove", y < 0); self:setSource("down", "TouchMove", y > 0)
+	self:refreshMoveVisuals(x, y)
 end
 function Input:_track(connection) table.insert(self.connections, connection) end
 function Input:connect(config)
@@ -478,6 +572,7 @@ function Input:setTouchAction(event, action)
 	if previous then self:setSource(previous, event, false) end
 	self.touch[event] = action
 	if action then self:claimControlTouch(event); self:setSource(action, event, true) end
+	self:refreshActionVisuals()
 end
 function Input:moveTouchAction(event)
 	if self.touch[event] == nil then return end
@@ -496,16 +591,59 @@ function Input:mountTouch(hud, layout, actions)
 	self.layout = layout
 	self.pointerContextSpec = self.touchLayout.pointerContexts
 	self.pointerContexts = normalizeContexts(self.pointerContextSpec)
+	local t = {
+		glassIdle = Color3.fromRGB(18, 18, 21),
+		glassActive = Color3.fromRGB(48, 50, 58),
+		text = Color3.fromRGB(246, 247, 250),
+		white = Color3.new(1, 1, 1),
+		thumbIdle = Color3.fromRGB(34, 36, 42),
+		thumbActive = Color3.fromRGB(52, 55, 64),
+	}
+	self.theme = t; self.touchTheme = "SmokedGlass"
+	local boldFont = (Enum.Font and Enum.Font.GothamBold) or Enum.Font.GothamMedium
+	local borderMode = Enum.ApplyStrokeMode and Enum.ApplyStrokeMode.Border
 	local overlay = Instance.new("Frame"); overlay.Name = "TouchControls"; overlay.Size = UDim2.fromScale(1, 1)
 	overlay.BackgroundTransparency = 1; overlay.Parent = hud; self.overlay = overlay
+	local function addStroke(parent, color, transparency, thickness)
+		local s = Instance.new("UIStroke"); s.Color = color; s.Transparency = transparency; s.Thickness = thickness or 1
+		if borderMode then s.ApplyStrokeMode = borderMode end
+		s.Parent = parent; return s
+	end
+	local chevronSpecs = {
+		up = {{.375, .5, -45}, {.625, .5, 45}},
+		down = {{.375, .5, 45}, {.625, .5, -45}},
+		left = {{.5, .375, -45}, {.5, .625, 45}},
+		right = {{.5, .375, 45}, {.5, .625, -45}},
+	}
+	local function makeChevron(parent, direction, pos, zIndex, barTrans)
+		local holder = Instance.new("Frame"); holder.Name = "Chevron_" .. direction; holder.BackgroundTransparency = 1
+		holder.Size = UDim2.fromOffset(20, 20); holder.AnchorPoint = Vector2.new(.5, .5); holder.Position = pos
+		holder.ZIndex = zIndex; holder.Parent = parent
+		local bars = {}
+		for _, arm in chevronSpecs[direction] do
+			local bar = Instance.new("Frame"); bar.Size = UDim2.fromOffset(8, 2); bar.AnchorPoint = Vector2.new(.5, .5)
+			bar.Position = UDim2.fromScale(arm[1], arm[2]); bar.Rotation = arm[3]
+			bar.BackgroundColor3 = t.text; bar.BackgroundTransparency = barTrans; bar.BorderSizePixel = 0
+			bar.ZIndex = zIndex; bar.Parent = holder
+			local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = bar
+			bars[#bars + 1] = bar
+		end
+		return holder, bars
+	end
 	local function button(name, label, position, size)
-		local b = Instance.new("TextButton"); b.Name = name; b.Text = label; b.TextSize = 12; b.Font = Enum.Font.GothamMedium
-		b.TextColor3 = Color3.new(1, 1, 1); b.BackgroundColor3 = Color3.fromRGB(13, 20, 31)
-		b.BackgroundTransparency = .35; b.BorderSizePixel = 0; b.Position = position; b.Size = size
+		local h = size.Y.Offset
+		local defaultTextSize = if h >= 84 then 16 elseif h >= 60 then 14 elseif h >= 50 then 13 else 12
+		local b = Instance.new("TextButton"); b.Name = name; b.Text = label; b.TextSize = defaultTextSize; b.Font = boldFont
+		b.AutoButtonColor = false; b.TextColor3 = t.text; b.BackgroundColor3 = t.glassIdle
+		b.BackgroundTransparency = .28; b.BorderSizePixel = 0; b.Position = position; b.Size = size
 		b.Selectable = false; b.ZIndex = 110; b.Parent = overlay
 		local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(.5, 0); corner.Parent = b
-        local border = Instance.new("UIStroke"); border.Color = Color3.fromRGB(211, 226, 240); border.Transparency = .55; border.Thickness = 1; border.Parent = b
-        return b
+		local stroke = addStroke(b, t.white, .82, 1)
+		local cap = Instance.new("Frame"); cap.Name = "InnerCap"; cap.Size = UDim2.new(1, -6, 1, -6)
+		cap.Position = UDim2.fromScale(.5, .5); cap.AnchorPoint = Vector2.new(.5, .5)
+		cap.BackgroundColor3 = t.white; cap.BackgroundTransparency = .96; cap.BorderSizePixel = 0; cap.ZIndex = 110; cap.Parent = b
+		local capCorner = Instance.new("UICorner"); capCorner.CornerRadius = UDim.new(.5, 0); capCorner.Parent = cap
+		return b, stroke, cap
 	end
 	if layout == "Pointer" then
 		local toggle = button("RightClick", "Right click: off", UDim2.new(1, -150, 1, -64), UDim2.fromOffset(138, 50))
@@ -522,29 +660,30 @@ function Input:mountTouch(hud, layout, actions)
 			end
 		end
 		self.moveContexts = normalizeContexts(self.touchLayout.moveContexts)
-		local zone = button("Move", "", self.touchLayout.movePosition or (if dynamic then UDim2.new(0, 88, 1, -88) else UDim2.new(0, 18, 1, -158)), self.touchLayout.moveSize or UDim2.fromOffset(if dynamic then 128 else 140, if dynamic then 128 else 140))
-		zone.BackgroundTransparency = if dynamic then .86 else .8
+		local zone, zoneStroke, zoneCap = button("Move", "", self.touchLayout.movePosition or (if dynamic then UDim2.new(0, 88, 1, -88) else UDim2.new(0, 18, 1, -158)), self.touchLayout.moveSize or UDim2.fromOffset(if dynamic then 128 else 140, if dynamic then 128 else 140))
+		zoneCap:Destroy(); zoneStroke.Transparency = .86; self.moveStroke = zoneStroke
+		zone.BackgroundTransparency = if dynamic then .86 else .56
 		if dynamic then zone.AnchorPoint = Vector2.new(.5, .5); zone.Active = false end
 		self.moveHomePosition = zone.Position
 		if hasDynamic then
-			local moveArea = Instance.new("TextButton"); moveArea.Name = "MoveArea"; moveArea.Text = ""
+			local moveArea = Instance.new("TextButton"); moveArea.Name = "MoveArea"; moveArea.Text = ""; moveArea.AutoButtonColor = false
 			moveArea.BackgroundTransparency = 1; moveArea.BorderSizePixel = 0
 			moveArea.Position = self.touchLayout.moveAreaPosition or UDim2.new(0, 0, .16, 0)
 			moveArea.Size = self.touchLayout.moveAreaSize or UDim2.new(.48, 0, .84, 0)
 			moveArea.ZIndex = 109; moveArea.Selectable = false; moveArea.Parent = overlay
 			self.moveArea = moveArea
 		end
-		self.moveArrows = {}
-		for _, cue in {{"▲", .5, .13, "up"}, {"▼", .5, .87, "down"}, {"◀", .13, .5, "left"}, {"▶", .87, .5, "right"}} do
-			local arrow = Instance.new("TextLabel"); arrow.BackgroundTransparency = 1; arrow.Text = cue[1]
-			arrow.TextSize = 12; arrow.TextColor3 = Color3.fromRGB(216, 228, 241); arrow.TextTransparency = .3
-			arrow.Size = UDim2.fromOffset(20, 20); arrow.AnchorPoint = Vector2.new(.5, .5); arrow.Position = UDim2.fromScale(cue[2], cue[3]); arrow.ZIndex = 111; arrow.Parent = zone
-			self.moveArrows[cue[4]] = arrow
+		self.moveArrows = {}; self.moveArrowBars = {}
+		for _, cue in {{.5, .12, "up"}, {.5, .88, "down"}, {.12, .5, "left"}, {.88, .5, "right"}} do
+			local holder, bars = makeChevron(zone, cue[3], UDim2.fromScale(cue[1], cue[2]), 111, .68)
+			self.moveArrows[cue[3]] = holder; self.moveArrowBars[cue[3]] = bars
 		end
-        local thumb = Instance.new("Frame"); thumb.Size = UDim2.fromOffset(42, 42); thumb.AnchorPoint = Vector2.new(.5, .5); thumb.Position = UDim2.fromScale(.5, .5)
-        thumb.BackgroundColor3 = Color3.fromRGB(202, 224, 239); thumb.BackgroundTransparency = .5; thumb.BorderSizePixel = 0; thumb.ZIndex = 112; thumb.Parent = zone
-        local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = thumb; self.thumb = thumb
+		local thumb = Instance.new("Frame"); thumb.Name = "Thumb"; thumb.Size = UDim2.fromOffset(44, 44); thumb.AnchorPoint = Vector2.new(.5, .5); thumb.Position = UDim2.fromScale(.5, .5)
+		thumb.BackgroundColor3 = t.thumbIdle; thumb.BackgroundTransparency = .32; thumb.BorderSizePixel = 0; thumb.ZIndex = 112; thumb.Parent = zone
+		local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(1, 0); corner.Parent = thumb; self.thumb = thumb
+		self.thumbStroke = addStroke(thumb, t.white, .74, 1)
 		local function beginMove(event, capture, dynamic)
+			if event.UserInputType == Enum.UserInputType.Touch and self.enabled and self.touchMode ~= "Off" then wakeTouch(self) end
 			if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and capture.Visible ~= false and not self.moveTouch then
 				self:claimControlTouch(event); self.moveTouch = event
 				if dynamic then
@@ -569,12 +708,50 @@ function Input:mountTouch(hud, layout, actions)
 			local dpad = Instance.new("Frame"); dpad.Name = "Dpad"; dpad.BackgroundTransparency = 1
 			dpad.Position = self.touchLayout.dpadPosition or UDim2.new(0, 18, 1, -158)
 			dpad.Size = self.touchLayout.dpadSize or UDim2.fromOffset(140, 140); dpad.Parent = overlay
-			self.dpad = dpad; self.dpadTouches = {}; self.dpadButtons = {}
-			for _, cue in {{"Up", "▲", .5, 0}, {"Down", "▼", .5, 1}, {"Left", "◀", 0, .5}, {"Right", "▶", 1, .5}} do
+			self.dpad = dpad; self.dpadTouches = {}; self.dpadButtons = {}; self.dpadArms = {}
+			local hub = Instance.new("Frame"); hub.Name = "CrossHub"; hub.Position = UDim2.new(.5, -23, .5, -23)
+			hub.Size = UDim2.fromOffset(46, 46); hub.BackgroundColor3 = t.glassIdle; hub.BackgroundTransparency = .28
+			hub.BorderSizePixel = 0; hub.ZIndex = 109; hub.Parent = dpad
+			local pivot = Instance.new("Frame"); pivot.Name = "Pivot"; pivot.Size = UDim2.fromOffset(14, 14)
+			pivot.Position = UDim2.fromScale(.5, .5); pivot.AnchorPoint = Vector2.new(.5, .5)
+			pivot.BackgroundColor3 = t.white; pivot.BackgroundTransparency = .93; pivot.BorderSizePixel = 0; pivot.ZIndex = 110; pivot.Parent = hub
+			local pivotCorner = Instance.new("UICorner"); pivotCorner.CornerRadius = UDim.new(1, 0); pivotCorner.Parent = pivot
+			addStroke(pivot, t.white, .86, 1)
+			local function hubEdge(name, pos, sz)
+				local e = Instance.new("Frame"); e.Name = name; e.Position = pos; e.Size = sz
+				e.BackgroundColor3 = t.white; e.BackgroundTransparency = .82; e.BorderSizePixel = 0; e.Visible = false; e.ZIndex = 110; e.Parent = hub
+				return e
+			end
+			self.dpadHubEdges = {
+				top = hubEdge("EdgeTop", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 1)),
+				bottom = hubEdge("EdgeBottom", UDim2.new(0, 0, 1, -1), UDim2.new(1, 0, 0, 1)),
+				left = hubEdge("EdgeLeft", UDim2.fromOffset(0, 0), UDim2.new(0, 1, 1, 0)),
+				right = hubEdge("EdgeRight", UDim2.new(1, -1, 0, 0), UDim2.new(0, 1, 1, 0)),
+			}
+			local armGeometry = {
+				up = {UDim2.new(.5, -23, .5, -68), UDim2.fromOffset(46, 45), UDim2.fromOffset(0, 0), UDim2.fromOffset(46, 59)},
+				down = {UDim2.new(.5, -23, .5, 23), UDim2.fromOffset(46, 45), UDim2.fromOffset(0, -14), UDim2.fromOffset(46, 59)},
+				left = {UDim2.new(.5, -68, .5, -23), UDim2.fromOffset(45, 46), UDim2.fromOffset(0, 0), UDim2.fromOffset(59, 46)},
+				right = {UDim2.new(.5, 23, .5, -23), UDim2.fromOffset(45, 46), UDim2.fromOffset(-14, 0), UDim2.fromOffset(59, 46)},
+			}
+			for _, cue in {{"Up", .5, 0}, {"Down", .5, 1}, {"Left", 0, .5}, {"Right", 1, .5}} do
 				local direction = string.lower(cue[1])
-				local b = button("Dpad" .. cue[1], cue[2], UDim2.fromScale(cue[3], cue[4]), UDim2.fromOffset(44, 44))
-				b.AnchorPoint = Vector2.new(cue[3], cue[4]); b.Parent = dpad; self.dpadButtons[direction] = b
+				local g = armGeometry[direction]
+				local clip = Instance.new("Frame"); clip.Name = "Arm_" .. cue[1]; clip.Position = g[1]; clip.Size = g[2]
+				clip.BackgroundTransparency = 1; clip.ClipsDescendants = true; clip.ZIndex = 109; clip.Parent = dpad
+				local cap = Instance.new("Frame"); cap.Name = "Cap"; cap.Position = g[3]; cap.Size = g[4]
+				cap.BackgroundColor3 = t.glassIdle; cap.BackgroundTransparency = .28; cap.BorderSizePixel = 0; cap.ZIndex = 109; cap.Parent = clip
+				local capCorner = Instance.new("UICorner"); capCorner.CornerRadius = UDim.new(0, 12); capCorner.Parent = cap
+				local armStroke = addStroke(cap, t.white, .82, 1)
+				local b = Instance.new("TextButton"); b.Name = "Dpad" .. cue[1]; b.Text = ""; b.AutoButtonColor = false
+				b.BackgroundTransparency = 1; b.BorderSizePixel = 0; b.Selectable = false
+				b.Position = UDim2.fromScale(cue[2], cue[3]); b.Size = UDim2.fromOffset(44, 44)
+				b.AnchorPoint = Vector2.new(cue[2], cue[3]); b.ZIndex = 111; b.Parent = dpad
+				local _, bars = makeChevron(b, direction, UDim2.fromScale(.5, .5), 112, .32)
+				self.dpadButtons[direction] = b
+				self.dpadArms[direction] = {clip = clip, cap = cap, stroke = armStroke, bars = bars}
 				self:_track(b.InputBegan:Connect(function(event)
+					if event.UserInputType == Enum.UserInputType.Touch and self.enabled and self.touchMode ~= "Off" then wakeTouch(self) end
 					if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and dpad.Visible and b.Visible then
 						self:setDpadTouch(event, direction)
 					end
@@ -585,14 +762,30 @@ function Input:mountTouch(hud, layout, actions)
 		self.touchButtons = {}
 		local positions = {{-18, -20, 64}, {-82, -88, 58}, {-150, -34, 52}, {-18, -158, 46}}
 		for i, spec in actions do
-            local pos = positions[i] or {-18 - (i - 1) * 68, -20, 54}
-            local b = button(spec.action, spec.label or spec.action, spec.position or UDim2.new(1, pos[1], 1, pos[2]), spec.size or UDim2.fromOffset(pos[3], pos[3]))
-            b.AnchorPoint = spec.anchorPoint or Vector2.new(1, 1)
-			b.TextSize = spec.textSize or 12
-			table.insert(self.touchButtons, {button = b, action = spec.action, defaultLabel = spec.label or spec.action,
+			local pos = positions[i] or {-18 - (i - 1) * 68, -20, 54}
+			local btnSize = spec.size or UDim2.fromOffset(pos[3], pos[3])
+			local b, stroke, cap = button(spec.action, spec.label or spec.action, spec.position or UDim2.new(1, pos[1], 1, pos[2]), btnSize)
+			b.AnchorPoint = spec.anchorPoint or Vector2.new(1, 1)
+			if spec.textSize then b.TextSize = spec.textSize end
+			local pauseIcon
+			local initText = b.Text
+			local mayPause = initText == "II" or initText == "?" or (spec.labels and (spec.labels.gameplay == "II" or spec.labels.default == "II"))
+			if mayPause then
+				pauseIcon = Instance.new("Frame"); pauseIcon.Name = "PauseIcon"; pauseIcon.Size = UDim2.fromOffset(16, 16)
+				pauseIcon.Position = UDim2.fromScale(.5, .5); pauseIcon.AnchorPoint = Vector2.new(.5, .5)
+				pauseIcon.BackgroundTransparency = 1; pauseIcon.ZIndex = 112; pauseIcon.Parent = b
+				for _, sx in {.3125, .6875} do
+					local bar = Instance.new("Frame"); bar.Size = UDim2.fromOffset(3, 12); bar.AnchorPoint = Vector2.new(.5, .5)
+					bar.Position = UDim2.fromScale(sx, .5); bar.BackgroundColor3 = t.text; bar.BackgroundTransparency = .06
+					bar.BorderSizePixel = 0; bar.ZIndex = 112; bar.Parent = pauseIcon
+					local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(1, 0); bc.Parent = bar
+				end
+			end
+			table.insert(self.touchButtons, {button = b, stroke = stroke, cap = cap, pauseIcon = pauseIcon,
+				action = spec.action, defaultLabel = spec.label or spec.action,
 				labels = spec.labels, contexts = normalizeContexts(spec.contexts), visibleOverride = spec.visible, labelOverride = nil})
-
 			self:_track(b.InputBegan:Connect(function(event)
+				if event.UserInputType == Enum.UserInputType.Touch and self.enabled and self.touchMode ~= "Off" then wakeTouch(self) end
 				if event.UserInputType == Enum.UserInputType.Touch and overlay.Visible and b.Visible ~= false then
 					self:setTouchAction(event, spec.action)
 				end

@@ -149,10 +149,13 @@ function Shell.settingsButtonVisible(mode, touchEnabled, lastInputType)
 	return true
 end
 function Shell.button(parent, text, callback)
-	local b = Instance.new("TextButton"); b.Text = text; b.TextSize = 16; b.Font = Enum.Font.GothamMedium
-	b.BackgroundColor3 = Color3.fromRGB(45, 51, 76); b.TextColor3 = Color3.fromRGB(240, 242, 255)
+	local b = Instance.new("TextButton"); b.Text = text; b.TextSize = 15; b.Font = (Enum.Font and Enum.Font.GothamBold) or Enum.Font.GothamMedium
+	b.AutoButtonColor = false; b.BackgroundColor3 = Color3.fromRGB(18, 18, 21); b.BackgroundTransparency = .28; b.TextColor3 = Color3.fromRGB(246, 247, 250)
 	b.BorderSizePixel = 0; b.Selectable = true; b.ZIndex = 102; b.Parent = parent
-	local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(0, 6); corner.Parent = b
+	local corner = Instance.new("UICorner"); corner.CornerRadius = UDim.new(.5, 0); corner.Parent = b
+	local stroke = Instance.new("UIStroke"); stroke.Color = Color3.new(1, 1, 1); stroke.Transparency = .82; stroke.Thickness = 1
+	if Enum.ApplyStrokeMode then stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border end
+	stroke.Parent = b
 	b.Activated:Connect(callback)
 	return b
 end

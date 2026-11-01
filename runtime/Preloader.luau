@@ -1,7 +1,31 @@
 --!optimize 2
 --!nonstrict
--- Minimalist black startup screen with bottom-right progress HUD, asset preloading, and cooperative CPU yield checkpoints.
+-- Minimalist black startup screen with bottom-right progress HUD, post-quit menu, asset preloading, and cooperative CPU yield checkpoints.
 local Preloader = {}
+
+local ignoredStartKeys = {
+	Escape = true, LeftAlt = true, RightAlt = true, LeftSuper = true, RightSuper = true,
+	LeftMeta = true, RightMeta = true, CapsLock = true, NumLock = true, ScrollLock = true,
+	Print = true, Pause = true, Thumbstick1 = true, Thumbstick2 = true,
+	F1 = true, F2 = true, F3 = true, F4 = true, F5 = true, F6 = true,
+	F7 = true, F8 = true, F9 = true, F10 = true, F11 = true, F12 = true,
+}
+
+function Preloader.shouldTriggerStart(input, processed)
+	if processed or not input then
+		return false
+	end
+	local keyCode = input.KeyCode
+	local keyName = if type(keyCode) == 'userdata' or type(keyCode) == 'table' then keyCode.Name else tostring(keyCode or '')
+	if keyName and ignoredStartKeys[keyName] then
+		return false
+	end
+	local kind = input.UserInputType
+	if kind == Enum.UserInputType.Keyboard or kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch then
+		return true
+	end
+	return tostring(kind):match('Gamepad') ~= nil
+end
 
 local function formatTitle(title)
 	if type(title) == 'string' and title ~= '' and title ~= 'Loading' then
@@ -53,6 +77,18 @@ function Preloader.new(options)
 			return
 		end
 		self.displayTitle = title
+		if self.promptTitle then
+			self.promptTitle.Text = if type(title) == 'string' and title ~= '' then title else 'Session Ended'
+		end
+		refreshVisuals()
+	end
+
+	function self:resetProgress()
+		if self.destroyed then
+			return
+		end
+		self.target = 0
+		self.progress = 0
 		refreshVisuals()
 	end
 
@@ -152,6 +188,7 @@ function Preloader.new(options)
 		self.progress = 1
 		refreshVisuals()
 		if self.group and scheduler and scheduler.delay then
+			self.fadeInAt = nil
 			self.fadeAt = clock()
 			-- Also destroy if rendering stops or the GUI is removed during the fade.
 			scheduler.delay(0.16, function()
@@ -180,28 +217,29 @@ function Preloader.new(options)
 		if self.hud then
 			self.hud.Visible = false
 		end
+		if self.promptTitle then
+			local title = promptOptions.title or self.displayTitle
+			self.promptTitle.Text = if type(title) == 'string' and title ~= '' and title ~= 'Loading' then title else 'Session Ended'
+		end
+		if self.promptButton then
+			self.promptButton.Text = ''
+			self.promptButton.Visible = true
+		end
+		if self.promptHint then
+			local hint = promptOptions.hint
+			self.promptHint.Text = if type(hint) == 'string' then hint else ''
+			self.promptHint.Visible = type(hint) == 'string' and hint ~= ''
+		end
 		if self.promptContainer then
 			self.promptContainer.Visible = true
 		end
-		if self.promptButton then
-			self.promptButton.Text = promptOptions.buttonText or 'Play Again'
-			self.promptButton.Visible = true
-		end
 		local started = clock()
 		self.promptStarted = started
+		local debounce = promptOptions.debounce or 0.2
 		if not options.headless then
-			self.startConnection = game:GetService('UserInputService').InputBegan:Connect(function(input)
-				local kind = input.UserInputType
-				if
-					clock() - started >= (promptOptions.debounce or 0.2)
-					and (
-						kind == Enum.UserInputType.Keyboard
-						or kind == Enum.UserInputType.MouseButton1
-						or kind == Enum.UserInputType.MouseButton2
-						or kind == Enum.UserInputType.Touch
-						or tostring(kind):match('Gamepad')
-					)
-				then
+			local uis = options.userInputService or game:GetService('UserInputService')
+			self.startConnection = uis.InputBegan:Connect(function(input, processed)
+				if clock() - started >= debounce and Preloader.shouldTriggerStart(input, processed) then
 					self:triggerStart()
 				end
 			end)
@@ -217,8 +255,13 @@ function Preloader.new(options)
 		if self.promptContainer then
 			self.promptContainer.Visible = false
 		end
-		if self.hud and not self.failed then
-			self.hud.Visible = true
+		if self.startTriggered and not self.destroyed and not self.failed then
+			self.target = 0
+			self.progress = 0
+			if self.hud then
+				self.hud.Visible = true
+			end
+			refreshVisuals()
 		end
 		return self.startTriggered and not self.destroyed
 	end
@@ -350,8 +393,12 @@ function Preloader.new(options)
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
+		GroupTransparency = if options.fadeIn then 1 else 0,
 	}, gui)
 	self.group = group
+	if options.fadeIn then
+		self.fadeInAt = clock()
+	end
 
 	make('Frame', {
 		Name = 'Curtain',
@@ -442,38 +489,63 @@ function Preloader.new(options)
 
 	local promptContainer = make('Frame', {
 		Name = 'Prompt',
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(360, 80),
+		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
 		Visible = false,
 	}, group)
 	self.promptContainer = promptContainer
 
-	self.promptLabel = make('TextLabel', {
-		Name = 'Message',
-		Position = UDim2.fromOffset(0, 0),
-		Size = UDim2.fromOffset(360, 22),
+	local initialPromptTitle = if type(self.displayTitle) == 'string' and self.displayTitle ~= '' and self.displayTitle ~= 'Loading'
+		then self.displayTitle
+		else 'Session Ended'
+	self.promptTitle = make('TextLabel', {
+		Name = 'PromptTitle',
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, -10),
+		Size = UDim2.fromOffset(420, 22),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamMedium,
-		TextSize = 14,
+		TextSize = 15,
 		TextColor3 = Color3.fromRGB(230, 230, 230),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Text = initialPromptTitle,
+	}, promptContainer)
+
+	self.promptLabel = make('TextLabel', {
+		Name = 'Message',
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 12),
+		Size = UDim2.fromOffset(420, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 13,
+		TextColor3 = Color3.fromRGB(136, 136, 136),
 		Text = self.stage,
+	}, promptContainer)
+
+	self.promptHint = make('TextLabel', {
+		Name = 'Hint',
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 32),
+		Size = UDim2.fromOffset(420, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		TextSize = 11,
+		TextColor3 = Color3.fromRGB(92, 92, 92),
+		Text = '',
+		Visible = false,
 	}, promptContainer)
 
 	self.promptButton = make('TextButton', {
 		Name = 'Action',
-		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 34),
-		Size = UDim2.fromOffset(108, 30),
-		BackgroundColor3 = Color3.fromRGB(28, 28, 28),
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
-		Text = 'Play Again',
-		Font = Enum.Font.GothamMedium,
-		TextSize = 13,
-		TextColor3 = Color3.fromRGB(230, 230, 230),
+		AutoButtonColor = false,
+		Text = '',
+		TextTransparency = 1,
 	}, promptContainer)
-	make('UICorner', { CornerRadius = UDim.new(0, 4) }, self.promptButton)
 	self.promptButton.Activated:Connect(function()
 		if self.waitingForStart and clock() - (self.promptStarted or 0) >= 0.2 then
 			self:triggerStart()
@@ -517,6 +589,12 @@ function Preloader.new(options)
 			group.GroupTransparency = alpha
 			if alpha >= 1 then
 				self:destroy()
+			end
+		elseif self.fadeInAt then
+			local alpha = math.clamp((clock() - self.fadeInAt) / 0.18, 0, 1)
+			group.GroupTransparency = 1 - alpha
+			if alpha >= 1 then
+				self.fadeInAt = nil
 			end
 		end
 	end)
